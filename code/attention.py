@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import warnings
+from typing import Optional
+import importlib.metadata
+import logging
+import math
+
+import bert_padding
+
+IMPL_USE_FLASH2 = False
+IMPL_USE_FLASH3 = False
+
+logger = logging.getLogger(__name__)
+_warned_messages = set()
+
+
+def _warn_once(message: str) -> None:
+    if message not in _warned_messages:
+        logger.warning(message)
+        _warned_messages.add(message)
+
+
+logger.warn_once = _warn_once
+
+
+class ModuleType:
+    in_module = "in_module"
+    out_module = "out_module"
+
+
+def init_weights(config, module, layer_dim: int, layer_id, type_of_module) -> None:
+    if hasattr(module, "weight") and module.weight is not None:
+        nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(layer_dim))
+    if hasattr(module, "bias") and module.bias is not None:
+        nn.init.zeros_(module.bias)
+
+
+try:
+    from flash_attn_interface import flash_attn_varlen_func
+
+    IMPL_USE_FLASH3 = True
+except ImportError:
+    pass
+# Import Flash Attention 2, which supports ALiBi https://github.com/Dao-AILab/flash-attention
+try:
+    from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_qkvpacked_func  # type: ignore
+
+    installed_version = importlib.metadata.version("flash_attn")  # type: ignore
+    if installed_version < "2.5.7":
+        raise ImportError("newer version of flash_attn required (>= 2.5.7)")
+    IMPL_USE_FLASH2 = True
+except ImportError:
+    pass
+
+try:
+    from flash_attn.layers.rotary import RotaryEmbedding  # type: ignore
+    from rotary import UnpaddedRotaryEmbedding  # type: ignore
+
+except ImportError:
+    RotaryEmbedding = None
+    UnpaddedRotaryEmbedding = None
+
+
+class FlexBertAttentionBase(nn.Module):
+    """A FlexBERT attention base class for type hints."""
+
+    def __init__(self, config: FlexBertConfig, layer_id: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+
+    def _init_weights(self, reset_params: bool = False):
+        raise NotImplementedError("This is a base class and should not be used directly.")
+
+    def forward(self, hidden_states: torch.Tensor, attn_mask: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("This is a base class and should not be used directly.")
+
+    def extra_repr(self) -> str:
+        repr = ""
+        if hasattr(self, "num_attention_heads"):
+            repr += f"num_attention_heads={self.num_attention_heads}"
+        if hasattr(self, "attn_head_size"):
+            repr += f", attn_head_size={self.attn_head_size}"
+        if hasattr(self, "sliding_window"):
+            repr += f", sliding_window={self.sliding_window if self.sliding_window != (-1, -1) else 'False'}"
+        if hasattr(self, "use_fa2"):
+            repr += f", use_fa2={self.use_fa2}"
+        if hasattr(self, "deterministic_fa2"):
+            repr += f", deterministic_fa2={self.deterministic_fa2}"
+        return repr
+
+
+
+class FlexBertUnpadRopeAttention(FlexBertAttentionBase):
+    """Performs multi-headed self attention on a batch of unpadded sequences.
+
+    If Flash Attention 2 is installed, this module uses Flash Attention to improve throughput.
+    If Flash Attention 2 is not installed, the implementation will use PyTorch's SDPA kernel,
+    which requires padding and unpadding inputs, adding some overhead.
+
+    See `forward` method for additional details.
+    """
+
+    def __init__(self, config: FlexBertConfig, layer_id: Optional[int] = None):
+        super().__init__(config=config, layer_id=layer_id)
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attn_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attn_head_size
+        self.p_dropout = config.attention_probs_dropout_prob
+        self.Wqkv = nn.Linear(config.hidden_size, 3 * self.all_head_size, bias=config.attn_qkv_bias)
+        self.Wo = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attn_out_bias)
+        self.out_drop = (
+            nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
+        )
+
+        if config.global_attn_every_n_layers > 0:
+            if config.sliding_window == -1:
+                raise ValueError("global_attn_every_n_layers` requires `sliding_window` to be set")
+            if layer_id % config.global_attn_every_n_layers != 0:
+                self.sliding_window = (config.sliding_window // 2, config.sliding_window // 2)
+            else:
+                self.sliding_window = (-1, -1)
+        else:
+            self.sliding_window = (config.sliding_window // 2, config.sliding_window // 2)
+
+        if config.rotary_emb_dim is None:
+            config.rotary_emb_dim = self.attn_head_size
+
+        rotary_base = config.rotary_emb_base
+        rotary_dim = config.rotary_emb_dim
+        if self.sliding_window != (-1, -1):
+            if config.local_attn_rotary_emb_base != -1:
+                rotary_base = config.local_attn_rotary_emb_base
+            if config.local_attn_rotary_emb_dim is not None:
+                rotary_dim = config.local_attn_rotary_emb_dim
+
+        assert UnpaddedRotaryEmbedding is not None, "rotary_emb is not installed"
+        self.rotary_emb = UnpaddedRotaryEmbedding(
+            dim=rotary_dim,
+            base=rotary_base,
+            scale_base=config.rotary_emb_scale_base,  # If scale_base is not None, this implements XPos (Sun et al., https://arxiv.org/abs/2212.10554).
+            interleaved=config.rotary_emb_interleaved,
+        )
+
+        self.use_fa2 = config.use_fa2
+        # flash attention 3 only supports global attention
+        self.use_fa3 = config.use_fa2 and self.sliding_window == (-1, -1) and IMPL_USE_FLASH3
+        self.deterministic_fa2 = config.deterministic_fa2
+        self.use_sdpa_attn_mask = config.use_sdpa_attn_mask
+
+        # Warn if defaulting to pytorch because of import issues
+        if not IMPL_USE_FLASH2 and self.use_fa2:
+            logger.warn_once(
+                "Unable to import flash_attn; defaulting FlexBERT attention implementation to PyTorch's"
+                " SDPA kernel. This requires padding and unpadding inputs, which will add some overhead."
+            )
+            self.use_fa2 = False
+        if not self.use_fa2:
+            if not self.use_sdpa_attn_mask:
+                logger.warn_once(
+                    "SDPA attention is being used without an attention mask. Including padding in the "
+                    " attention calculation may cause differences from the Flash Attention implementation."
+                )
+            else:
+                logger.warn_once(
+                    "SDPA attention with an attention mask doesn't use the Flash Attention kernel and will"
+                    " use more memory during the backward pass. Use the FA2 backend for linear memory scaling"
+                    " with sequence length."
+                )
+            if self.sliding_window[0] > 0:
+                raise ValueError("Sliding window is not implemented for the PyTorch SDPA path. Use the FA2 backend.")
+
+    def _init_weights(self, reset_params: bool = False):
+        init_weights(
+            self.config,
+            self.Wqkv,
+            layer_dim=self.config.hidden_size,
+            layer_id=None,
+            type_of_module=ModuleType.in_module,
+        )
+        init_weights(
+            self.config,
+            self.Wo,
+            layer_dim=self.config.hidden_size,
+            layer_id=self.layer_id,
+            type_of_module=ModuleType.out_module,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        indices: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Perform self-attention.
+
+        There are two attention implementations supported: PyTorch's SDPA attention and Flash Attention 2.
+
+        The arguments are unpadded. The SDPA implementation of attention requires padded arguments while the
+        Flash Attention implementation does not. If using SDPA we first call `pad_input`. Once we compute
+        attention, we re-unpad our outputs for the other layers. The pad/unpad operations add overhead, but not
+        sending pad tokens through ffs saves compute.
+
+        Args:
+            hidden_states: (total_nnz, dim)
+            cu_seqlens: (batch + 1,)
+            max_seqlen: int
+            indices: (total_nnz,)
+            attn_mask: (batch, max_seqlen)
+
+        Returns:
+            attention: (total_nnz, dim)
+        """
+        bs, dim = hidden_states.shape
+        qkv = self.Wqkv(hidden_states)
+
+        # only needed for inference when we have KV cache
+        seqlen_offset = 0
+
+        # (total_seqlen, 3, nheads, headdim)
+        qkv = qkv.view(-1, 3, self.num_attention_heads, self.attn_head_size)
+        qkv = self.rotary_emb(qkv, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, seqlen_offset=seqlen_offset)
+
+        if self.use_fa3:
+            convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
+            if convert_dtype:
+                # FA2 implementation only supports fp16 and bf16. If FA2 is supported,
+                # bfloat16 must be supported as of FA2 2.5.7. (Turing GPUs not supported)
+                orig_dtype = qkv.dtype
+                qkv = qkv.to(torch.bfloat16)
+                q, k, v = qkv.view(-1, 3, self.num_attention_heads, self.attn_head_size).unbind(dim=1)
+
+                attn, _ = flash_attn_varlen_func(
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    deterministic=self.deterministic_fa2,
+                )
+                attn = attn.to(orig_dtype)  # type: ignore
+            else:
+                q, k, v = qkv.view(-1, 3, self.num_attention_heads, self.attn_head_size).unbind(dim=1)
+                attn, _ = flash_attn_varlen_func(
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    deterministic=self.deterministic_fa2,
+                )
+            attn = attn.view(bs, dim)
+        elif self.use_fa2:
+            convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
+            if convert_dtype:
+                # FA2 implementation only supports fp16 and bf16. If FA2 is supported,
+                # bfloat16 must be supported as of FA2 2.5.7. (Turing GPUs not supported)
+                orig_dtype = qkv.dtype
+                qkv = qkv.to(torch.bfloat16)
+
+                attn = flash_attn_varlen_qkvpacked_func(
+                    qkv,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    dropout_p=self.p_dropout,
+                    deterministic=self.deterministic_fa2,
+                    window_size=self.sliding_window,
+                )
+                attn = attn.to(orig_dtype)  # type: ignore
+            else:
+                attn = flash_attn_varlen_qkvpacked_func(
+                    qkv,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    dropout_p=self.p_dropout,
+                    deterministic=self.deterministic_fa2,
+                    window_size=self.sliding_window,
+                )
+            attn = attn.view(bs, dim)
+        else:
+            qkv = bert_padding.pad_input(
+                qkv, indices, cu_seqlens.shape[0] - 1, attn_mask.shape[-1]
+            )  # batch, max_seqlen, thd
+            unpad_bs, seqlen, *_ = qkv.shape
+
+            q, k, v = qkv.transpose(3, 1).unbind(dim=2)  # b h s d
+            attn = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.p_dropout,
+                attn_mask=attn_mask[:, None, None, :seqlen].to(torch.bool).expand(unpad_bs, 1, seqlen, seqlen)
+                if self.use_sdpa_attn_mask
+                else None,
+            )
+            attn = attn.transpose(1, 2).view(unpad_bs, -1, dim)  # b s h d
+            attn = bert_padding.unpad_input_only(attn, torch.squeeze(attn_mask) == 1)
+
+        return self.out_drop(self.Wo(attn))

@@ -16,6 +16,7 @@ __pycache__/
 .Trash-*/
 .jupyter/
 .local/
+.models/
 
 # Python distribution / packaging
 .Python
