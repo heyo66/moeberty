@@ -18,7 +18,7 @@ continue_train = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 train_config = TrainerConfig(
-    vocab_size = tokenizer.vocab_size,
+    vocab_size = 50368,
     num_epochs = 1,
 
     use_ddp = False,
@@ -62,7 +62,7 @@ train_config = TrainerConfig(
 )
 
 config = ModelConfig(
-        vocab_size = tokenizer.vocab_size,
+        vocab_size = 50368,
 
         num_dims = 768,
         num_heads = 12,
@@ -90,7 +90,7 @@ config = ModelConfig(
         moe_aux_loss_coef = 0.01,
         moe_shared_experts = 1,
         use_lossfreebalance = True,
-    )
+)
 
 
 model = Transformer(config)

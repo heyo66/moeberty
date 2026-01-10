@@ -66,6 +66,7 @@ class TrainerConfig:
     mlm_probability: float = 0.15
 
 
+
 class DataLoader():
     def __init__(self, config, tokenizer=None, rank=0, world_size=1):
         self.config = config
@@ -103,6 +104,7 @@ class DataLoader():
         """
         new_idx = current_idx + self.config.batch_size
         
+        # For MLM, just get the full sequences - no need to offset by 1
         x_list = [self.dataset[idx]['input_ids'] 
                   for idx in range(current_idx, min(new_idx, self.len_dataset))]
         x = torch.stack(x_list)
@@ -370,25 +372,84 @@ class Trainer():
             )
     
     def _mask_inputs(self, input_ids: torch.Tensor):
+        """
+        Create masked inputs and labels for MLM training.
+    
+        Strategy (following BERT):
+        - 15% of tokens are selected for masking
+        - Of those selected:
+          - 80% replaced with [MASK]
+          - 10% replaced with random token
+          - 10% kept unchanged
+        
+        Args:
+            input_ids: Tensor of shape (batch_size, seq_len)
+        
+        Returns:
+            masked_inputs: Input with some tokens masked
+            labels: Original tokens at masked positions, -100 elsewhere
+        """
+        # Validate inputs are within vocab range
+        if input_ids.max() >= self.config.vocab_size:
+            raise ValueError(
+                f"Input contains token ID {input_ids.max()} which is >= vocab_size {self.config.vocab_size}"
+            )
+        if input_ids.min() < 0:
+            raise ValueError(
+                f"Input contains negative token ID {input_ids.min()}"
+            )
+    
+        # Validate mask token is in range
+        if self.mask_token_id >= self.config.vocab_size:
+            raise ValueError(
+                f"mask_token_id {self.mask_token_id} is >= vocab_size {self.config.vocab_size}"
+            )
+    
         labels = input_ids.clone()
+    
+        # Create probability matrix for masking
         prob_matrix = torch.full(labels.shape, self.mlm_probability, device=labels.device)
+    
+        # Don't mask special tokens (padding, CLS, SEP, BOS, EOS)
         if self.special_token_ids:
             special_mask = torch.zeros_like(labels, dtype=torch.bool)
             for token_id in self.special_token_ids:
-                special_mask |= labels == token_id
+                special_mask |= (labels == token_id)
             prob_matrix.masked_fill_(special_mask, 0.0)
-
+    
+        # Select tokens to mask
         masked_indices = torch.bernoulli(prob_matrix).bool()
+    
+        # Set labels to -100 for non-masked tokens (ignore in loss)
         labels = labels.masked_fill(~masked_indices, -100)
-
+    
+        # Create masked inputs
         masked_inputs = input_ids.clone()
+    
+        # Generate random values for the 80/10/10 split
         rand = torch.rand(labels.shape, device=labels.device)
+    
+        # 80% of masked tokens -> replace with [MASK]
         mask_token_mask = masked_indices & (rand < 0.8)
-        random_token_mask = masked_indices & (rand >= 0.8) & (rand < 0.9)
-
         masked_inputs[mask_token_mask] = self.mask_token_id
-        random_tokens = torch.randint(self.config.vocab_size, labels.shape, device=labels.device)
-        masked_inputs[random_token_mask] = random_tokens[random_token_mask]
+    
+        # 10% of masked tokens -> replace with random token
+        # CRITICAL FIX: Ensure random tokens are within valid range [0, vocab_size)
+        random_token_mask = masked_indices & (rand >= 0.8) & (rand < 0.9)
+        if random_token_mask.any():
+            # Generate random tokens in valid range
+            random_tokens = torch.randint(
+                low=0,
+                high=self.config.vocab_size,  # high is exclusive, so this gives [0, vocab_size)
+                size=labels.shape,
+                dtype=masked_inputs.dtype,
+                device=labels.device
+            )
+            masked_inputs[random_token_mask] = random_tokens[random_token_mask]
+    
+        # Remaining 10% of masked tokens -> keep unchanged
+        # (no action needed, already in masked_inputs)
+    
         return masked_inputs, labels
     
     def step(self, data_loader, accumulation_steps: int,
