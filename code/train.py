@@ -9,7 +9,7 @@ import torch
 torch.set_float32_matmul_precision('high')
 torch.cuda.empty_cache()
 
-tokenizer_id = "bert-base-uncased"
+tokenizer_id = "answerdotai/ModernBERT-base"
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -19,7 +19,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 train_config = TrainerConfig(
     vocab_size = tokenizer.vocab_size,
-    num_epochs = 2,
+    num_epochs = 1,
 
     use_ddp = False,
     use_moe = True,

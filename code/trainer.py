@@ -66,7 +66,6 @@ class TrainerConfig:
     mlm_probability: float = 0.15
 
 
-
 class DataLoader():
     def __init__(self, config, tokenizer=None, rank=0, world_size=1):
         self.config = config
@@ -80,9 +79,9 @@ class DataLoader():
         self.len_dataset = len(self.dataset)
 
         if rank == 0:
-            print(f"{'Total tokens loaded: '} {self.len_dataset * config.max_seq_len:,}")
+            print(f"Total tokens loaded: {self.len_dataset * config.max_seq_len:,}")
 
-        self.train_len_dataset = math.ceil((1-config.val_ratio) * self.len_dataset)
+        self.train_len_dataset = math.ceil((1 - config.val_ratio) * self.len_dataset)
         self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
         shard_size = self.len_dataset // world_size 
@@ -94,26 +93,54 @@ class DataLoader():
         self.val_current_idx = self.val_start_idx
 
     def get_batch(self, current_idx: int, start_idx: int, end_idx: int):
+        """
+        Returns a batch of sequences for MLM training.
+        For MLM, we just need the raw sequences - masking happens in the trainer.
+        
+        Returns:
+            x: Tensor of shape (batch_size, seq_len) containing input_ids
+            new_idx: Updated index for next batch
+        """
         new_idx = current_idx + self.config.batch_size
         
-        x_l, y_l = zip(*[(self.dataset[idx]['input_ids'][:-1], self.dataset[idx]['input_ids'][1:])
-                    for idx in range(current_idx, min(new_idx, self.len_dataset))])
-        x, y = torch.stack(list(x_l)), torch.stack(list(y_l))
+        x_list = [self.dataset[idx]['input_ids'] 
+                  for idx in range(current_idx, min(new_idx, self.len_dataset))]
+        x = torch.stack(x_list)
     
         if new_idx >= end_idx:
             new_idx = start_idx
             self.new_epoch()
 
-        return x, y, new_idx
+        return x, new_idx
 
     def next_batch(self, split):
+        """
+        Get next batch for training or validation.
+        
+        Args:
+            split: 'train' or 'val'
+            
+        Returns:
+            x: Tensor of input_ids (batch_size, seq_len)
+            None: Placeholder for compatibility (labels created by masking)
+        """
         if split == "train":
-            x, y, self.train_current_idx = self.get_batch(self.train_current_idx, self.train_start_idx, self.train_end_idx)
-        else: # validation
-            x, y, self.val_current_idx = self.get_batch(self.val_current_idx, self.val_start_idx, self.len_dataset)
-        return x, y
+            x, self.train_current_idx = self.get_batch(
+                self.train_current_idx, 
+                self.train_start_idx, 
+                self.train_end_idx
+            )
+        else:  # validation
+            x, self.val_current_idx = self.get_batch(
+                self.val_current_idx, 
+                self.val_start_idx, 
+                self.len_dataset
+            )
+        # Return None for y since labels are created by _mask_inputs() in the trainer
+        return x, None
     
     def reset(self, rank: int = 0, world_size: int = 1):
+        """Reset dataloader to initial state."""
         self.current_epoch = 0
         self.seed = self.config.seed
         self.load_dataset(self.seed)
@@ -130,6 +157,7 @@ class DataLoader():
         self.val_current_idx = self.val_start_idx
 
     def new_epoch(self):
+        """Start a new epoch with shuffled data."""
         self.current_epoch += 1
         if self.config.hf_dataset_name and hasattr(self.dataset, "shuffle"):
             self.dataset = self.dataset.shuffle(seed=self.seed + self.current_epoch)
@@ -137,16 +165,21 @@ class DataLoader():
             self.load_dataset(self.seed + self.current_epoch)
 
     def load_dataset(self, seed: int):
+        """Load dataset from tokenized files or HuggingFace."""
         if self.config.hf_dataset_name:
             self.dataset = self.load_hf_dataset(seed)
             return
 
         if DatatroveFolderDataset is None:
-            raise ImportError("datatrove is required for tokenized_dataset_path, but it's not installed.")
+            raise ImportError(
+                "datatrove is required for tokenized_dataset_path, but it's not installed."
+            )
 
         self.dataset = DatatroveFolderDataset(
             folder_path=self.config.tokenized_dataset_path,
-            filename_pattern=os.path.join(self.config.tokenized_dataset_path, "**", "*.ds"),
+            filename_pattern=os.path.join(
+                self.config.tokenized_dataset_path, "**", "*.ds"
+            ),
             seq_len=self.config.max_seq_len,
             token_size=self.token_size,
             recursive=True,
@@ -155,13 +188,16 @@ class DataLoader():
         )
 
     def load_hf_dataset(self, seed: int):
+        """Load and tokenize HuggingFace dataset."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required when using hf_dataset_name.")
 
         try:
             from datasets import load_dataset, load_from_disk
         except ImportError as exc:
-            raise ImportError("datasets is required for hf_dataset_name. pip install datasets") from exc
+            raise ImportError(
+                "datasets is required for hf_dataset_name. pip install datasets"
+            ) from exc
 
         dataset_kwargs = {
             "path": self.config.hf_dataset_name,
@@ -189,13 +225,18 @@ class DataLoader():
                             text_field = name
                             break
             if not text_field or text_field not in dataset.column_names:
-                raise ValueError("hf_text_field is required and must exist in the dataset.")
+                raise ValueError(
+                    "hf_text_field is required and must exist in the dataset."
+                )
 
             seq_len = self.config.max_seq_len
             eos_id = self.tokenizer.eos_token_id
 
             def tokenize_and_chunk(batch):
-                # Pack short samples together to fill full seq_len chunks.
+                """
+                Tokenize text and pack into fixed-length sequences.
+                For MLM, we want complete sequences, not offset pairs.
+                """
                 tokenized = self.tokenizer(
                     batch[text_field],
                     add_special_tokens=False,
@@ -208,6 +249,7 @@ class DataLoader():
                     if self.config.hf_add_eos and eos_id is not None:
                         ids = ids + [eos_id]
                     buffer.extend(ids)
+                    # Pack sequences to exactly seq_len tokens
                     while len(buffer) >= seq_len:
                         input_ids.append(buffer[:seq_len])
                         buffer = buffer[seq_len:]
@@ -216,7 +258,7 @@ class DataLoader():
             map_kwargs = {
                 "batched": True,
                 "remove_columns": dataset.column_names,
-                "desc": "Tokenizing",
+                "desc": "Tokenizing and chunking for MLM",
             }
             if self.config.hf_num_proc > 1:
                 map_kwargs["num_proc"] = self.config.hf_num_proc
@@ -231,7 +273,10 @@ class DataLoader():
         return dataset
 
     def num_train_steps(self):
-        return math.ceil((self.train_end_idx-self.train_start_idx) / self.config.batch_size)
+        """Calculate number of training steps per epoch."""
+        return math.ceil(
+            (self.train_end_idx - self.train_start_idx) / self.config.batch_size
+        )
 
 
 class Trainer():
@@ -323,7 +368,7 @@ class Trainer():
                 name=wandb_run_name,
                 config=asdict(config),
             )
-
+    
     def _mask_inputs(self, input_ids: torch.Tensor):
         labels = input_ids.clone()
         prob_matrix = torch.full(labels.shape, self.mlm_probability, device=labels.device)

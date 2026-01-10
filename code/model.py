@@ -1,4 +1,14 @@
+
 import torch
+if not hasattr(torch.library, 'wrap_triton'):
+    def wrap_triton(fn):
+        return fn
+    torch.library.wrap_triton = wrap_triton
+
+# Fix graph breaks from scalar outputs
+import torch._dynamo
+torch._dynamo.config.capture_scalar_outputs = True
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn as nn

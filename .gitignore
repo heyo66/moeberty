@@ -16,9 +16,9 @@ __pycache__/
 .Trash-*/
 .jupyter/
 .local/
-.models/
-.code/wandb/
-.code/log/
+models/
+code/wandb/
+code/log/
 
 # Python distribution / packaging
 .Python
