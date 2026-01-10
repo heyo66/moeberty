@@ -77,6 +77,10 @@ config = ModelConfig(
         attn_qkv_bias = False,
         attn_out_bias = False,
         attn_out_dropout_prob = 0.0,
+        global_attn_every_n_layers = 3,
+        sliding_window = 128,
+        rotary_emb_base = 160000,
+        local_attn_rotary_emb_base = 10000,
     
         context_len = 1024,
         
