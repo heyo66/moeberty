@@ -91,6 +91,9 @@ config = ModelConfig(
         moe_aux_loss_coef = 0.01,
         moe_shared_experts = 1,
         use_lossfreebalance = False,
+
+        init_method = "full_megatron",
+        init_std = 0.02,
     )
 
 init_process_group("nccl")

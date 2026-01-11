@@ -3,13 +3,13 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import warnings
 from typing import Optional
 import importlib.metadata
 import logging
-import math
 
 import bert_padding
+
+from .initialization import init_weights, ModuleType
 
 IMPL_USE_FLASH2 = False
 IMPL_USE_FLASH3 = False
@@ -25,18 +25,6 @@ def _warn_once(message: str) -> None:
 
 
 logger.warn_once = _warn_once
-
-
-class ModuleType:
-    in_module = "in_module"
-    out_module = "out_module"
-
-
-def init_weights(config, module, layer_dim: int, layer_id, type_of_module) -> None:
-    if hasattr(module, "weight") and module.weight is not None:
-        nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(layer_dim))
-    if hasattr(module, "bias") and module.bias is not None:
-        nn.init.zeros_(module.bias)
 
 
 try:

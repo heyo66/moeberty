@@ -73,6 +73,12 @@ class ModelConfig:
     hidden_size: Optional[int] = None
     num_attention_heads: Optional[int] = None
     embedding_size: Optional[int] = None
+    num_hidden_layers: Optional[int] = None
+
+    init_method: str = "full_megatron"
+    init_std: float = 0.02
+    init_cutoff_factor: Optional[float] = None
+    init_small_embedding: bool = False
 
     ffn_dim_multiplier: Optional[int] = None    # optional multiplier to compute ffn_hidden_dims
 
@@ -81,6 +87,8 @@ class ModelConfig:
             self.hidden_size = self.num_dims
         if self.num_attention_heads is None:
             self.num_attention_heads = self.num_heads
+        if self.num_hidden_layers is None:
+            self.num_hidden_layers = self.num_layers
         if self.rotary_emb_base is None:
             self.rotary_emb_base = self.rope_theta
         if self.use_fa2 is None:
