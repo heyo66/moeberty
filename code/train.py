@@ -43,7 +43,7 @@ train_config = TrainerConfig(
     steps_for_eval = 20,
     eval_interval = 20,
 
-    checkpoints_frequency = 2000,
+    checkpoints_frequency = 1000,
     path_to_checkpoints = "./model_testing",
 
     tokenized_dataset_path = "",
@@ -67,11 +67,10 @@ config = ModelConfig(
         num_dims = 768,
         num_heads = 12,
         num_kv_heads = 12,
-        num_layers = 12,
+        num_layers = 14,
         ffn_hidden_dims = 512 * 2,
 
         rmsnorm_eps = 1e-6,
-        rope_theta = 1e5,
 
         attention_probs_dropout_prob = 0.0,
         attn_qkv_bias = False,

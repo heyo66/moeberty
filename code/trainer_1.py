@@ -452,38 +452,11 @@ class Trainer():
     
         return masked_inputs, labels
     
-    def _calculate_mlm_accuracy(self, logits: torch.Tensor, labels: torch.Tensor):
-        """
-        Calculate MLM accuracy for masked tokens.
-        
-        Args:
-            logits: Model predictions (batch_size, seq_len, vocab_size)
-            labels: Ground truth labels (batch_size, seq_len) with -100 for non-masked
-            
-        Returns:
-            accuracy: Percentage of correctly predicted masked tokens
-        """
-        # Get predictions (argmax over vocab dimension - last dimension)
-        predictions = torch.argmax(logits, dim=-1)  # (batch_size, seq_len)
-        
-        # Create mask for tokens that should be predicted (labels != -100)
-        mask = labels != -100
-        
-        # Calculate correct predictions
-        correct = (predictions == labels) & mask
-        
-        # Calculate accuracy only over masked tokens
-        if mask.sum() == 0:
-            return 0.0
-        
-        accuracy = correct.sum().float() / mask.sum().float()
-        return accuracy.item()
-    
     def step(self, data_loader, accumulation_steps: int,
               num_tokens: int, split: str = "train"):
         """
         Performs single forward/backward pass with gradient accumulation.
-        Returns: (total_loss, cross_entropy_loss, mlm_accuracy, number_of_processed_tokens)
+            Returns: (total_loss, cross_entropy_loss, number_of_processed_tokens)
         """
         x, _ = data_loader.next_batch(split=split)
         x = x.to(self.device)
@@ -491,25 +464,12 @@ class Trainer():
         num_tokens += torch.numel(x)
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-            logits, loss, ce_loss = self.model(x, y)
-
-        # Calculate MLM accuracy (before loss division and backward)
-        # Detach logits to avoid keeping computation graph for accuracy calculation
-        with torch.no_grad():
-            # Ensure logits are in the right shape (batch_size, seq_len, vocab_size)
-            if logits.dim() == 2:
-                # If logits are (batch_size * seq_len, vocab_size), reshape them
-                batch_size = x.size(0)
-                seq_len = x.size(1)
-                logits_reshaped = logits.view(batch_size, seq_len, -1)
-                mlm_acc = self._calculate_mlm_accuracy(logits_reshaped, y)
-            else:
-                mlm_acc = self._calculate_mlm_accuracy(logits, y)
+            _, loss, ce_loss = self.model(x, y)
 
         loss /= accumulation_steps
 
         loss.backward()
-        return loss, ce_loss, mlm_acc, num_tokens
+        return loss, ce_loss, num_tokens
     
 
     def train(self, data_loader):
@@ -552,31 +512,22 @@ class Trainer():
                 accumulated_loss = 0.0
                 ce_loss_accum = 0.0
                 ce_loss_steps = 0
-                mlm_acc_accum = 0.0
-                mlm_acc_steps = 0
                 num_tokens = 0
 
                 ddp_nosync_ctx = self.model.no_sync() if self.ddp else nullcontext()
                 with ddp_nosync_ctx:
                     for _ in range(self.config.accumulation_steps - 1):
-                        loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
+                        loss, ce_loss, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
                         accumulated_loss += loss
                         if isinstance(ce_loss, torch.Tensor):
                             ce_loss_accum += ce_loss.detach()
                             ce_loss_steps += 1
-                        mlm_acc_accum += mlm_acc
-                        mlm_acc_steps += 1
 
-                loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
+                loss, ce_loss, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
                 accumulated_loss += loss.detach()
                 if isinstance(ce_loss, torch.Tensor):
                     ce_loss_accum += ce_loss.detach()
                     ce_loss_steps += 1
-                mlm_acc_accum += mlm_acc
-                mlm_acc_steps += 1
-
-                # Calculate average MLM accuracy
-                avg_mlm_acc = mlm_acc_accum / mlm_acc_steps if mlm_acc_steps > 0 else 0.0
 
                 # Calculate expert biases using Auxiliary Loss-Free Balance method for MoE (https://arxiv.org/pdf/2408.15664)
                 if self.use_moe and self.use_lossfreebalance: 
@@ -587,7 +538,7 @@ class Trainer():
                             error = avg_count - count.float()
                             self.model.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
 
-                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #ToDO
 
                 optimizer.step()
                 optimizer.zero_grad()
@@ -599,12 +550,11 @@ class Trainer():
 
                 # Logging 
                 if self.master_process:
-                    print(f"Epoch: {epoch} | Step: {step} | loss: {accumulated_loss:.4f} | acc: {avg_mlm_acc:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
+                    print(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
                 if self.master_process and self.use_wandb and (step % self.config.wandb_log_interval == 0):
                     global_step = epoch * num_steps_per_epoch + step
                     log_data = {
                         "train/loss": float(accumulated_loss),
-                        "train/mlm_accuracy": float(avg_mlm_acc),
                         "train/grad_norm": float(norm),
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/tokens_per_sec": float(tokens_per_sec),
@@ -646,21 +596,20 @@ class Trainer():
                 # Evaluation 
                 if self.master_process and ((step>0 and step % self.config.eval_interval == 0) or step == last_step):
                     self.model.eval() 
-                    val_loss, val_acc = self.eval(data_loader)
+                    val_loss = self.eval(data_loader)
 
                     eval_dir = os.path.dirname(self.config.eval_log_file)
                     if eval_dir:
                         os.makedirs(eval_dir, exist_ok=True)
 
                     with open(self.config.eval_log_file, "a") as f:
-                        f.write(f"Step: {step * (epoch+1)}, val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}, norm: {norm:.4f}, lr: {scheduler.get_last_lr()[0]}, time: {t1 - t0:.2f}s, tok/s: {tokens_per_sec:.1f} \n")
+                        f.write(f"Step: {step * (epoch+1)}, val_loss: {val_loss:.4f}, norm: {norm:.4f}, lr: {scheduler.get_last_lr()[0]}, time: {t1 - t0:.2f}s, tok/s: {tokens_per_sec:.1f} \n")
 
                     if self.use_wandb:
                         global_step = epoch * num_steps_per_epoch + step
                         wandb.log(
                             {
                                 "val/loss": float(val_loss),
-                                "val/mlm_accuracy": float(val_acc),
                                 "val/epoch": epoch,
                                 "val/step": step,
                             },
@@ -679,35 +628,19 @@ class Trainer():
     
     def eval(self, data_loader):
         """
-        Evaluates model on validation split using running average of first [steps_for_eval] batches.
-        Returns: (average_loss, average_mlm_accuracy)
+        Evaluates model on validation split using running average of first [steps_for_eval] batches
         """
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_acc_accum = 0.0
             for _ in range(self.steps_for_eval):
                 x, _ = data_loader.next_batch(split="val")
                 x = x.to(self.device)
                 x, y = self._mask_inputs(x)
                 with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                    logits, loss, ce_loss = self.model(x, y)
-                
-                # Calculate MLM accuracy - handle both 2D and 3D logits
-                if logits.dim() == 2:
-                    # If logits are (batch_size * seq_len, vocab_size), reshape them
-                    batch_size = x.size(0)
-                    seq_len = x.size(1)
-                    logits_reshaped = logits.view(batch_size, seq_len, -1)
-                    mlm_acc = self._calculate_mlm_accuracy(logits_reshaped, y)
-                else:
-                    mlm_acc = self._calculate_mlm_accuracy(logits, y)
-                
+                    _, loss, ce_loss = self.model(x, y)
                 loss /= self.steps_for_eval
                 val_loss_accum += loss.detach()
-                val_acc_accum += mlm_acc
-                
-            avg_acc = val_acc_accum / self.steps_for_eval
-            return val_loss_accum, avg_acc
+            return val_loss_accum
 
     def save_checkpoints(self, optimizer, path: str, name: str):
         os.makedirs(path, exist_ok=True)

@@ -19,6 +19,7 @@ __pycache__/
 models/
 code/wandb/
 code/log/
+code/model_testing/
 
 # Python distribution / packaging
 .Python
