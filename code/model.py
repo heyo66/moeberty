@@ -16,7 +16,6 @@ import torch.nn.functional as F
 import random
 import time
 import math
-import tiktoken
 import inspect
 import os
 from dataclasses import dataclass
