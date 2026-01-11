@@ -30,7 +30,7 @@ train_config = TrainerConfig(
 
     seed = 1338,
     max_seq_len = 1024,
-    batch_size = 64, # 16,
+    batch_size = 16, # 16,
     accumulation_steps = 16,
     
     weight_decay = 0.1,
@@ -67,7 +67,7 @@ config = ModelConfig(
         num_dims = 768,
         num_heads = 12,
         num_kv_heads = 12,
-        num_layers = 22,
+        num_layers = 14,
         ffn_hidden_dims = 512 * 2,
 
         rmsnorm_eps = 1e-6,
