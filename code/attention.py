@@ -9,7 +9,7 @@ import logging
 
 import bert_padding
 
-from .initialization import init_weights, ModuleType
+from initialization import init_weights, ModuleType
 
 IMPL_USE_FLASH2 = False
 IMPL_USE_FLASH3 = False

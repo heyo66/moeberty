@@ -1,3 +1,4 @@
+
 # Ignore generated or temporary files managed by the Workbench
 .project/*
 !.project/spec.yaml
@@ -61,3 +62,4 @@ data/scratch/*
 !data/scratch/.gitkeep
 code/Untitled1.ipynb
 .vscode/settings.json
+modal_train.py
