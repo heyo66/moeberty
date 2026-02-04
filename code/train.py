@@ -21,7 +21,7 @@ train_config = TrainerConfig(
     vocab_size = 50368,
     num_epochs = 1,
 
-    use_ddp = False,
+    use_ddp = True,
     use_moe = True,
     use_lossfreebalance = False,
     clean_cuda_cache = True,
