@@ -51,7 +51,7 @@ class ModelConfig:
     moe_shared_experts: int = 0         # number of shared experts (DeepSeekMoE)
     use_lossfreebalance: bool = False   # use Auxiliary-loss-free load balancing strategy for mixture-of-experts from DeepSeek https://arxiv.org/pdf/2408.15664
 
-    rmsnorm_eps: float = 1e-6
+    layernorm_eps: float = 1e-6
     rope_theta: float = 1e5
 
     attention_probs_dropout_prob: float = 0.0
@@ -126,11 +126,11 @@ class Rotary(nn.Module):
         return self.cos_saved, self.sin_saved
 
 
-class RMSNorm(torch.nn.Module):
+class Layernorm(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.g = nn.Parameter(torch.ones(config.num_dims))
-        self.eps = config.rmsnorm_eps
+        self.eps = config.layernorm_eps
     
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -421,8 +421,8 @@ class Block(nn.Module):
             self.ffn = FeedForward(config)
 
 
-        self.norm_attention = torch.nn.modules.normalization.RMSNorm(config.num_dims, config.rmsnorm_eps) # you also can use RMSNorm(config)
-        self.norm_ffn = torch.nn.modules.normalization.RMSNorm(config.num_dims, config.rmsnorm_eps) # you also can use RMSNorm(config)
+        self.norm_attention = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
+        self.norm_ffn = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
 
     def forward(self, x, start_pos):
         _ = start_pos
@@ -466,7 +466,7 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         for layer_id in range(self.num_layers):
             self.blocks.append(Block(config, layer_id=layer_id))
 
-        self.norm = torch.nn.modules.normalization.RMSNorm(config.num_dims, config.rmsnorm_eps) # you also can use RMSNorm(config)
+        self.norm = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
         self.ll_head = nn.Linear(self.num_dims, self.vocab_size, bias=False)
         
 
@@ -551,7 +551,7 @@ def main():
     #     num_layers = 16,
     #     ffn_hidden_dims = 1024 * 4,
 
-    #     rmsnorm_eps = 1e-6,
+    #     layernorm_eps = 1e-6,
     #     rope_theta = 1e5,
 
     #     context_len = 1024,
