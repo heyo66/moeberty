@@ -34,9 +34,9 @@ class ModuleType:
 
 def init_weights(config, module, layer_dim: int, layer_id, type_of_module) -> None:
     if hasattr(module, "weight") and module.weight is not None:
-        nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(layer_dim))
+        nn.init.normal_(module.weight, mean=0.0, std=0.006)
     if hasattr(module, "bias") and module.bias is not None:
-        nn.init.zeros_(module.bias)
+        nn.init.normal_(module.bias, mean=0.0, std=0.006)
 
 
 try:

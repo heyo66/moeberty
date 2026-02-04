@@ -9,7 +9,6 @@ if not hasattr(torch.library, 'wrap_triton'):
 import torch._dynamo
 torch._dynamo.config.capture_scalar_outputs = True
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F

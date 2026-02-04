@@ -42,6 +42,8 @@ train_config = TrainerConfig(
     val_ratio = 0.005,
     steps_for_eval = 20,
     eval_interval = 20,
+    
+    mlm_probability = 0.30,
 
     checkpoints_frequency = 1000,
     path_to_checkpoints = "./model_testing",
