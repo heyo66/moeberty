@@ -75,6 +75,7 @@ class DataLoader():
         self.seed = config.seed
         self.token_size = 2 if config.vocab_size < 65535 else 4
         self.rank = rank
+        self.world_size = world_size
 
         self.load_dataset(self.seed)
         self.len_dataset = len(self.dataset)
@@ -271,6 +272,12 @@ class DataLoader():
                 dataset.save_to_disk(tokenized_path)
 
         dataset = dataset.shuffle(seed=seed)
+        if self.world_size > 1:
+            dataset = dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True
+            )
         dataset.set_format(type="torch", columns=["input_ids"])
         return dataset
 
@@ -322,7 +329,12 @@ class Trainer():
             self.model = torch.compile(self.model)
             
         # DDP
-        if n_gpus > 1 and config.use_ddp:   
+        if n_gpus > 1 and config.use_ddp:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "DDP requested but torch.distributed is not initialized. "
+                    "Launch with torchrun and call init_process_group() before Trainer()."
+                )
             self.ddp = True
             self.ddp_rank = int(os.environ['RANK'])
             self.ddp_local_rank = int(os.environ['LOCAL_RANK'])

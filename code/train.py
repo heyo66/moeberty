@@ -5,6 +5,9 @@ from trainer import Trainer, TrainerConfig, DataLoader
 
 from transformers import AutoTokenizer
 import torch
+import torch.distributed as dist
+import argparse
+import os
 
 torch.set_float32_matmul_precision('high')
 torch.cuda.empty_cache()
@@ -17,11 +20,33 @@ checkpoint_path = './model_testing'
 continue_train = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def setup_distributed():
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available in this build.")
+    if dist.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ddp", action="store_true", help="Enable DDP (launch with torchrun).")
+    return parser.parse_args()
+
+args = parse_args()
+
 train_config = TrainerConfig(
     vocab_size = 50368,
     num_epochs = 1,
 
-    use_ddp = True,
+    use_ddp = args.ddp,
     use_moe = True,
     use_lossfreebalance = False,
     clean_cuda_cache = True,
@@ -112,8 +137,18 @@ if continue_train:
 
     model.load_state_dict(new_state_dict, strict=False)
 
-model.to(device)
+rank = 0
+world_size = 1
+if args.ddp:
+    setup_distributed()
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
 
-data_loader = DataLoader(train_config, tokenizer=tokenizer)
+if not args.ddp:
+    model.to(device)
+
+data_loader = DataLoader(train_config, tokenizer=tokenizer, rank=rank, world_size=world_size)
 trainer = Trainer(train_config, model, tokenizer)
 trainer.train(data_loader)
+
+cleanup_distributed()
