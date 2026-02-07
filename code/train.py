@@ -48,15 +48,15 @@ train_config = TrainerConfig(
 
     use_ddp = args.ddp,
     use_moe = True,
-    use_lossfreebalance = False,
+    use_lossfreebalance = True,
     clean_cuda_cache = True,
     use_compile = True,
     use_dtype = "bfloat16",
 
-    seed = 1338,
-    max_seq_len = 1024,
-    batch_size = 16, # 16,
-    accumulation_steps = 16,
+    seed = 42,
+    max_seq_len = 128,
+    batch_size = 1024,
+    accumulation_steps = 2,
     
     weight_decay = 0.1,
     warmup_ratio = 0.1,
@@ -74,18 +74,18 @@ train_config = TrainerConfig(
     path_to_checkpoints = "./model_testing",
 
     tokenized_dataset_path = "",
-    hf_dataset_name = "HuggingFaceTB/cosmopedia",
-    hf_dataset_config = "stanford",
+    hf_dataset_name = "allenai/c4",
+    hf_dataset_config = "en",
     hf_dataset_split = "train",
     hf_text_field = "text",
     hf_add_eos = True,
     hf_cache_dir = "./.cache/hf",
     hf_tokenized_path = "./.cache/tokenized",
     hf_num_proc = 64,
-    eval_log_file = "log/eval_cosmopedia.txt",
+    eval_log_file = "log/eval_c4.txt",
     use_wandb = True,
     wandb_project = "forschungsprojekt",
-    wandb_run_name = "smollm-moe",
+    wandb_run_name = "moebert",
 )
 
 config = ModelConfig(
@@ -94,27 +94,26 @@ config = ModelConfig(
         num_dims = 768,
         num_heads = 12,
         num_kv_heads = 12,
-        num_layers = 14,
-        ffn_hidden_dims = 512 * 2,
+        num_layers = 22,
+        ffn_hidden_dims = 1152,
 
-        rmsnorm_eps = 1e-6,
+        layernorm_eps=1e-6,
 
-        attention_probs_dropout_prob = 0.0,
+        attention_probs_dropout_prob = 0.1,
         attn_qkv_bias = False,
         attn_out_bias = False,
         attn_out_dropout_prob = 0.0,
         global_attn_every_n_layers = 3,
         sliding_window = 128,
-        rotary_emb_base = 160000,
-        local_attn_rotary_emb_base = 10000,
+        rotary_emb_base = 10000,
     
-        context_len = 1024,
+        context_len = 128,
         
         use_cache = False,
         use_flash = True,
         use_moe = True,
 
-        moe_num_experts = 4,
+        moe_num_experts = 16,
         moe_routed_experts = 2,
         moe_eps = 1e-6,
         moe_aux_loss_coef = 0.01,
