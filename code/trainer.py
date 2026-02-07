@@ -346,12 +346,7 @@ class DataLoader():
         train_dataset = load_dataset(**self._dataset_kwargs)
         self.text_field = self._resolve_text_field(train_dataset)
 
-        if self.world_size > 1:
-            train_dataset = train_dataset.shard(
-                num_shards=self.world_size,
-                index=self.rank,
-                contiguous=True,
-            )
+        train_dataset = self._shard_streaming_dataset(train_dataset)
         if self.config.hf_streaming_shuffle:
             train_dataset = train_dataset.shuffle(
                 seed=seed,
@@ -362,12 +357,7 @@ class DataLoader():
         val_kwargs = dict(self._dataset_kwargs)
         val_kwargs["split"] = val_split
         val_dataset = load_dataset(**val_kwargs)
-        if self.world_size > 1:
-            val_dataset = val_dataset.shard(
-                num_shards=self.world_size,
-                index=self.rank,
-                contiguous=True,
-            )
+        val_dataset = self._shard_streaming_dataset(val_dataset)
 
         if self.rank == 0 and not self.config.hf_val_dataset_split:
             print(
@@ -398,12 +388,7 @@ class DataLoader():
         train_kwargs = dict(self._dataset_kwargs)
         train_kwargs["split"] = self.config.hf_dataset_split
         train_dataset = load_dataset(**train_kwargs)
-        if self.world_size > 1:
-            train_dataset = train_dataset.shard(
-                num_shards=self.world_size,
-                index=self.rank,
-                contiguous=True,
-            )
+        train_dataset = self._shard_streaming_dataset(train_dataset)
         if self.config.hf_streaming_shuffle:
             train_dataset = train_dataset.shuffle(
                 seed=seed,
@@ -414,12 +399,7 @@ class DataLoader():
         val_kwargs = dict(self._dataset_kwargs)
         val_kwargs["split"] = val_split
         val_dataset = load_dataset(**val_kwargs)
-        if self.world_size > 1:
-            val_dataset = val_dataset.shard(
-                num_shards=self.world_size,
-                index=self.rank,
-                contiguous=True,
-            )
+        val_dataset = self._shard_streaming_dataset(val_dataset)
 
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -438,14 +418,36 @@ class DataLoader():
         val_kwargs = dict(self._dataset_kwargs)
         val_kwargs["split"] = val_split
         val_dataset = load_dataset(**val_kwargs)
-        if self.world_size > 1:
-            val_dataset = val_dataset.shard(
-                num_shards=self.world_size,
-                index=self.rank,
-                contiguous=True,
-            )
+        val_dataset = self._shard_streaming_dataset(val_dataset)
         self.val_dataset = val_dataset
         self.val_iter = self._make_stream_iter(self.val_dataset)
+
+    def _shard_streaming_dataset(self, dataset):
+        if self.world_size <= 1:
+            return dataset
+        try:
+            from datasets.distributed import split_dataset_by_node
+            return split_dataset_by_node(
+                dataset,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+        except Exception:
+            if hasattr(dataset, "shard"):
+                try:
+                    return dataset.shard(
+                        num_shards=self.world_size,
+                        index=self.rank,
+                        contiguous=True,
+                    )
+                except Exception:
+                    pass
+            if self.rank == 0:
+                print(
+                    "Warning: Unable to shard streaming dataset; "
+                    "all ranks will see the same data."
+                )
+            return dataset
 
     def _make_stream_iter(self, dataset):
         return iter(self._stream_tokenized_sequences(dataset, self.text_field))
