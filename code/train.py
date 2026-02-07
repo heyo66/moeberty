@@ -67,6 +67,7 @@ train_config = TrainerConfig(
     val_ratio = 0.005,
     steps_for_eval = 20,
     eval_interval = 20,
+    train_steps_per_epoch = 89000,
     
     mlm_probability = 0.30,
 
@@ -77,11 +78,13 @@ train_config = TrainerConfig(
     hf_dataset_name = "allenai/c4",
     hf_dataset_config = "en",
     hf_dataset_split = "train",
+    hf_val_dataset_split = "validation",
     hf_text_field = "text",
     hf_add_eos = True,
     hf_cache_dir = "./.cache/hf",
     hf_tokenized_path = "./.cache/tokenized",
     hf_num_proc = 64,
+    hf_streaming = True,
     eval_log_file = "log/eval_c4.txt",
     use_wandb = True,
     wandb_project = "forschungsprojekt",

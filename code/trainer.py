@@ -52,11 +52,16 @@ class TrainerConfig:
     hf_dataset_name: str = ""                           # huggingface dataset name (e.g. "HuggingFaceTB/cosmopedia")
     hf_dataset_config: str = "stanford"                         # optional hf dataset config name
     hf_dataset_split: str = "train"
+    hf_val_dataset_split: str = ""                      # optional validation split for streaming
     hf_text_field: str = ""                             # text field name in hf dataset
     hf_add_eos: bool = True
     hf_cache_dir: str = ""                              # optional cache dir
     hf_num_proc: int = 1                                # map workers for tokenization
     hf_tokenized_path: str = ""                         # optional path to save/load tokenized dataset
+    hf_streaming: bool = False                          # enable HF streaming mode
+    hf_streaming_buffer_size: int = 10_000              # shuffle buffer size for streaming
+    hf_streaming_shuffle: bool = True                   # shuffle streaming dataset
+    train_steps_per_epoch: int = 0                      # required when hf_streaming=True (optimizer steps/epoch)
     eval_log_file: str = "logs/eval.txt"                # path to file to write eval results
     use_wandb: bool = False
     wandb_project: str = ""
@@ -76,23 +81,27 @@ class DataLoader():
         self.token_size = 2 if config.vocab_size < 65535 else 4
         self.rank = rank
         self.world_size = world_size
+        self.streaming = bool(config.hf_dataset_name and config.hf_streaming)
 
-        self.load_dataset(self.seed)
-        self.len_dataset = len(self.dataset)
+        if self.streaming:
+            self._init_streaming(self.seed)
+        else:
+            self.load_dataset(self.seed)
+            self.len_dataset = len(self.dataset)
 
-        if rank == 0:
-            print(f"Total tokens loaded: {self.len_dataset * config.max_seq_len:,}")
+            if rank == 0:
+                print(f"Total tokens loaded: {self.len_dataset * config.max_seq_len:,}")
 
-        self.train_len_dataset = math.ceil((1 - config.val_ratio) * self.len_dataset)
-        self.val_len_dataset = self.len_dataset - self.train_len_dataset
+            self.train_len_dataset = math.ceil((1 - config.val_ratio) * self.len_dataset)
+            self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
-        shard_size = self.len_dataset // world_size 
-        self.train_start_idx = rank * shard_size
-        self.train_end_idx = self.train_start_idx + shard_size
-        self.train_current_idx = self.train_start_idx
+            shard_size = self.len_dataset // world_size 
+            self.train_start_idx = rank * shard_size
+            self.train_end_idx = self.train_start_idx + shard_size
+            self.train_current_idx = self.train_start_idx
 
-        self.val_start_idx = self.train_len_dataset
-        self.val_current_idx = self.val_start_idx
+            self.val_start_idx = self.train_len_dataset
+            self.val_current_idx = self.val_start_idx
 
     def get_batch(self, current_idx: int, start_idx: int, end_idx: int):
         """
@@ -127,6 +136,9 @@ class DataLoader():
             x: Tensor of input_ids (batch_size, seq_len)
             None: Placeholder for compatibility (labels created by masking)
         """
+        if self.streaming:
+            return self._next_stream_batch(split)
+
         if split == "train":
             x, self.train_current_idx = self.get_batch(
                 self.train_current_idx, 
@@ -146,6 +158,10 @@ class DataLoader():
         """Reset dataloader to initial state."""
         self.current_epoch = 0
         self.seed = self.config.seed
+        if self.streaming:
+            self._init_streaming(self.seed)
+            return
+
         self.load_dataset(self.seed)
         self.len_dataset = len(self.dataset)
 
@@ -162,6 +178,9 @@ class DataLoader():
     def new_epoch(self):
         """Start a new epoch with shuffled data."""
         self.current_epoch += 1
+        if self.streaming:
+            self._reset_stream_iters(self.seed + self.current_epoch)
+            return
         if self.config.hf_dataset_name and hasattr(self.dataset, "shuffle"):
             self.dataset = self.dataset.shuffle(seed=self.seed + self.current_epoch)
         else:
@@ -170,6 +189,8 @@ class DataLoader():
     def load_dataset(self, seed: int):
         """Load dataset from tokenized files or HuggingFace."""
         if self.config.hf_dataset_name:
+            if self.config.hf_streaming:
+                raise RuntimeError("Streaming should be initialized via _init_streaming().")
             self.dataset = self.load_hf_dataset(seed)
             return
 
@@ -218,19 +239,7 @@ class DataLoader():
             dataset = load_dataset(**dataset_kwargs)
 
         if "input_ids" not in dataset.column_names:
-            text_field = self.config.hf_text_field
-            if not text_field:
-                if "text" in dataset.column_names:
-                    text_field = "text"
-                else:
-                    for name, feature in dataset.features.items():
-                        if getattr(feature, "dtype", None) == "string":
-                            text_field = name
-                            break
-            if not text_field or text_field not in dataset.column_names:
-                raise ValueError(
-                    "hf_text_field is required and must exist in the dataset."
-                )
+            text_field = self._resolve_text_field(dataset)
 
             seq_len = self.config.max_seq_len
             eos_id = self.tokenizer.eos_token_id
@@ -283,9 +292,216 @@ class DataLoader():
 
     def num_train_steps(self):
         """Calculate number of training steps per epoch."""
+        if self.streaming:
+            if self.config.train_steps_per_epoch <= 0:
+                raise ValueError(
+                    "train_steps_per_epoch must be > 0 when hf_streaming=True."
+                )
+            return self.config.train_steps_per_epoch * self.config.accumulation_steps
         return math.ceil(
             (self.train_end_idx - self.train_start_idx) / self.config.batch_size
         )
+
+    def _resolve_text_field(self, dataset):
+        text_field = self.config.hf_text_field
+        if text_field:
+            if text_field not in dataset.column_names:
+                raise ValueError(
+                    "hf_text_field is required and must exist in the dataset."
+                )
+            return text_field
+        if "text" in dataset.column_names:
+            return "text"
+        try:
+            for name, feature in dataset.features.items():
+                if getattr(feature, "dtype", None) == "string":
+                    return name
+        except Exception:
+            pass
+        raise ValueError(
+            "hf_text_field is required and must exist in the dataset."
+        )
+
+    def _init_streaming(self, seed: int):
+        if self.tokenizer is None:
+            raise ValueError("tokenizer is required when using hf_dataset_name.")
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "datasets is required for hf_dataset_name. pip install datasets"
+            ) from exc
+
+        self.text_field = None
+        self._dataset_kwargs = {
+            "path": self.config.hf_dataset_name,
+            "split": self.config.hf_dataset_split,
+            "streaming": True,
+        }
+        if self.config.hf_dataset_config:
+            self._dataset_kwargs["name"] = self.config.hf_dataset_config
+        if self.config.hf_cache_dir:
+            self._dataset_kwargs["cache_dir"] = self.config.hf_cache_dir
+
+        train_dataset = load_dataset(**self._dataset_kwargs)
+        self.text_field = self._resolve_text_field(train_dataset)
+
+        if self.world_size > 1:
+            train_dataset = train_dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True,
+            )
+        if self.config.hf_streaming_shuffle:
+            train_dataset = train_dataset.shuffle(
+                seed=seed,
+                buffer_size=self.config.hf_streaming_buffer_size,
+            )
+
+        val_split = self.config.hf_val_dataset_split or self.config.hf_dataset_split
+        val_kwargs = dict(self._dataset_kwargs)
+        val_kwargs["split"] = val_split
+        val_dataset = load_dataset(**val_kwargs)
+        if self.world_size > 1:
+            val_dataset = val_dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True,
+            )
+
+        if self.rank == 0 and not self.config.hf_val_dataset_split:
+            print(
+                "hf_streaming=True but hf_val_dataset_split is not set; "
+                "validation will sample from the same split as training."
+            )
+
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.train_iter = self._make_stream_iter(self.train_dataset)
+        self.val_iter = self._make_stream_iter(self.val_dataset)
+
+        self.len_dataset = None
+        self.train_len_dataset = None
+        self.val_len_dataset = None
+
+        if self.rank == 0:
+            print("HF streaming enabled.")
+
+    def _reset_stream_iters(self, seed: int):
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "datasets is required for hf_dataset_name. pip install datasets"
+            ) from exc
+
+        train_kwargs = dict(self._dataset_kwargs)
+        train_kwargs["split"] = self.config.hf_dataset_split
+        train_dataset = load_dataset(**train_kwargs)
+        if self.world_size > 1:
+            train_dataset = train_dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True,
+            )
+        if self.config.hf_streaming_shuffle:
+            train_dataset = train_dataset.shuffle(
+                seed=seed,
+                buffer_size=self.config.hf_streaming_buffer_size,
+            )
+
+        val_split = self.config.hf_val_dataset_split or self.config.hf_dataset_split
+        val_kwargs = dict(self._dataset_kwargs)
+        val_kwargs["split"] = val_split
+        val_dataset = load_dataset(**val_kwargs)
+        if self.world_size > 1:
+            val_dataset = val_dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True,
+            )
+
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.train_iter = self._make_stream_iter(self.train_dataset)
+        self.val_iter = self._make_stream_iter(self.val_dataset)
+
+    def _reset_val_iter(self):
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "datasets is required for hf_dataset_name. pip install datasets"
+            ) from exc
+
+        val_split = self.config.hf_val_dataset_split or self.config.hf_dataset_split
+        val_kwargs = dict(self._dataset_kwargs)
+        val_kwargs["split"] = val_split
+        val_dataset = load_dataset(**val_kwargs)
+        if self.world_size > 1:
+            val_dataset = val_dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True,
+            )
+        self.val_dataset = val_dataset
+        self.val_iter = self._make_stream_iter(self.val_dataset)
+
+    def _make_stream_iter(self, dataset):
+        return iter(self._stream_tokenized_sequences(dataset, self.text_field))
+
+    def _stream_tokenized_sequences(self, dataset, text_field: str):
+        seq_len = self.config.max_seq_len
+        eos_id = self.tokenizer.eos_token_id
+        buffer = []
+        for example in dataset:
+            text_value = example.get(text_field)
+            if text_value is None:
+                continue
+            if isinstance(text_value, list):
+                texts = [t for t in text_value if isinstance(t, str) and t]
+            else:
+                texts = [text_value] if isinstance(text_value, str) and text_value else []
+            if not texts:
+                continue
+
+            tokenized = self.tokenizer(
+                texts,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            for ids in tokenized["input_ids"]:
+                if self.config.hf_add_eos and eos_id is not None:
+                    ids = ids + [eos_id]
+                buffer.extend(ids)
+                while len(buffer) >= seq_len:
+                    chunk = buffer[:seq_len]
+                    buffer = buffer[seq_len:]
+                    yield {"input_ids": chunk}
+
+    def _next_stream_batch(self, split: str):
+        iterator = self.train_iter if split == "train" else self.val_iter
+        x_list = []
+        while len(x_list) < self.config.batch_size:
+            try:
+                sample = next(iterator)
+            except StopIteration:
+                if split == "train":
+                    self.new_epoch()
+                    iterator = self.train_iter
+                else:
+                    self._reset_val_iter()
+                    iterator = self.val_iter
+                continue
+            ids = sample.get("input_ids")
+            if ids is None:
+                continue
+            if len(ids) != self.config.max_seq_len:
+                continue
+            x_list.append(torch.tensor(ids, dtype=torch.long))
+        x = torch.stack(x_list)
+        return x, None
 
 
 class Trainer():
@@ -559,6 +775,8 @@ class Trainer():
         self.model.train()
 
         for epoch in range(self.num_epochs):
+            if getattr(data_loader, "streaming", False) and epoch > 0:
+                data_loader.new_epoch()
             for step in range(num_steps_per_epoch):
                 t0 = time.perf_counter()
                 accumulated_loss = 0.0
