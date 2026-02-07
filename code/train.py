@@ -55,7 +55,7 @@ train_config = TrainerConfig(
 
     seed = 42,
     max_seq_len = 128,
-    batch_size = 512,
+    batch_size = 256,
     accumulation_steps = 2,
     
     weight_decay = 0.1,

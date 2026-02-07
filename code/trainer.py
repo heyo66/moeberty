@@ -566,7 +566,12 @@ class Trainer():
 
             self.model.to(self.device)
             
-            self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
+            # MoE activates only a subset of experts per step, so some params are unused.
+            self.model = DDP(
+                self.model,
+                device_ids=[self.ddp_local_rank],
+                find_unused_parameters=self.use_moe,
+            )
         else:
             self.ddp = False
             self.ddp_rank = 0
@@ -801,7 +806,7 @@ class Trainer():
                 with ddp_nosync_ctx:
                     for _ in range(self.config.accumulation_steps - 1):
                         loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
-                        accumulated_loss += loss
+                        accumulated_loss += float(loss.detach())
                         if isinstance(ce_loss, torch.Tensor):
                             ce_loss_accum += ce_loss.detach()
                             ce_loss_steps += 1
@@ -809,7 +814,7 @@ class Trainer():
                         mlm_acc_steps += 1
 
                 loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
-                accumulated_loss += loss.detach()
+                accumulated_loss += float(loss.detach())
                 if isinstance(ce_loss, torch.Tensor):
                     ce_loss_accum += ce_loss.detach()
                     ce_loss_steps += 1
