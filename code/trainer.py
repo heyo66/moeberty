@@ -251,6 +251,8 @@ class DataLoader():
                 """
                 tokenized = self.tokenizer(
                     batch[text_field],
+                    truncation=True,
+                    max_length=seq_len,
                     add_special_tokens=False,
                     return_attention_mask=False,
                     return_token_type_ids=False,
@@ -469,6 +471,8 @@ class DataLoader():
 
             tokenized = self.tokenizer(
                 texts,
+                truncation=True,
+                max_length=seq_len,
                 add_special_tokens=False,
                 return_attention_mask=False,
                 return_token_type_ids=False,
@@ -510,7 +514,6 @@ class Trainer():
     def __init__(self, config, model, tokenizer):
         self.config = config
         self.model = model
-        self.raw_m = model
         self.num_epochs = config.num_epochs
 
         self.use_moe = config.use_moe
@@ -573,6 +576,9 @@ class Trainer():
             if self.device != "cpu":
                 self.model.to(self.device)
 
+        # Base model without DDP wrapper (and after compile/device moves).
+        self.raw_m = self.model.module if self.ddp else self.model
+
         if self.master_process:
             print("Device:", self.device)
             print(f"Model's trainable params: {sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) / 1e6:.2f}M")
@@ -580,10 +586,13 @@ class Trainer():
             print(f"use {'torch.compile()'}: {use_compile}")
             print(f"Use MoE: {'Yes ' if self.use_moe else 'No'}")
             if self.use_moe:
-                print(f"Number of experts: {self.model.blocks[0].ffn.num_experts}")
-                print(f"Number of used experts during inference: {self.model.blocks[0].ffn.moe_routed_experts}")
+                print(f"Number of experts: {self.raw_m.blocks[0].ffn.num_experts}")
+                print(f"Number of used experts during inference: {self.raw_m.blocks[0].ffn.moe_routed_experts}")
                 print(f"Method of aux_loss: {'loss-free-balance' if config.use_lossfreebalance else 'default'}")
-                print(f"Number of parameters will be used during inference: {((sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) - sum(p.numel() for p in self.model.blocks[0].ffn.parameters()) * len(self.model.blocks) * (1-(self.model.blocks[0].ffn.moe_routed_experts + self.model.blocks[0].ffn.moe_shared_experts) / (self.model.blocks[0].ffn.num_experts + self.model.blocks[0].ffn.moe_shared_experts)))) / 1e6:.2f}M")
+                print(
+                    "Number of parameters will be used during inference: "
+                    f"{((sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) - sum(p.numel() for p in self.raw_m.blocks[0].ffn.parameters()) * len(self.raw_m.blocks) * (1-(self.raw_m.blocks[0].ffn.moe_routed_experts + self.raw_m.blocks[0].ffn.moe_shared_experts) / (self.raw_m.blocks[0].ffn.num_experts + self.raw_m.blocks[0].ffn.moe_shared_experts)))) / 1e6:.2f}M"
+                )
 
         self.use_wandb = bool(config.use_wandb)
         if self.use_wandb and wandb is None:
@@ -812,12 +821,12 @@ class Trainer():
 
                 # Calculate expert biases using Auxiliary Loss-Free Balance method for MoE (https://arxiv.org/pdf/2408.15664)
                 if self.use_moe and self.use_lossfreebalance: 
-                    for block in range(len(self.model.blocks)):
-                        expert_counts = torch.bincount(ce_loss[1].flatten(), minlength=self.model.blocks[block].ffn.moe_routed_experts)  
+                    for block in range(len(self.raw_m.blocks)):
+                        expert_counts = torch.bincount(ce_loss[1].flatten(), minlength=self.raw_m.blocks[block].ffn.moe_routed_experts)  
                         avg_count = expert_counts.float().mean()
                         for i, count in enumerate(expert_counts):
                             error = avg_count - count.float()
-                            self.model.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
+                            self.raw_m.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
 
                 norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
