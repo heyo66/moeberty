@@ -69,6 +69,7 @@ class TrainerConfig:
     wandb_entity: str = ""
     wandb_log_interval: int = 1
     mlm_probability: float = 0.15
+    train_mlm_acc_interval: int = 100  # compute/log MLM accuracy every N training steps
 
 
 
@@ -724,7 +725,7 @@ class Trainer():
         return accuracy.item()
     
     def step(self, data_loader, accumulation_steps: int,
-              num_tokens: int, split: str = "train"):
+              num_tokens: int, split: str = "train", compute_mlm_acc: bool = True):
         """
         Performs single forward/backward pass with gradient accumulation.
         Returns: (total_loss, cross_entropy_loss, mlm_accuracy, number_of_processed_tokens)
@@ -737,18 +738,20 @@ class Trainer():
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             logits, loss, ce_loss = self.model(x, y)
 
-        # Calculate MLM accuracy (before loss division and backward)
-        # Detach logits to avoid keeping computation graph for accuracy calculation
-        with torch.no_grad():
-            # Ensure logits are in the right shape (batch_size, seq_len, vocab_size)
-            if logits.dim() == 2:
-                # If logits are (batch_size * seq_len, vocab_size), reshape them
-                batch_size = x.size(0)
-                seq_len = x.size(1)
-                logits_reshaped = logits.view(batch_size, seq_len, -1)
-                mlm_acc = self._calculate_mlm_accuracy(logits_reshaped, y)
-            else:
-                mlm_acc = self._calculate_mlm_accuracy(logits, y)
+        mlm_acc = None
+        if compute_mlm_acc:
+            # Calculate MLM accuracy (before loss division and backward)
+            # Detach logits to avoid keeping computation graph for accuracy calculation
+            with torch.no_grad():
+                # Ensure logits are in the right shape (batch_size, seq_len, vocab_size)
+                if logits.dim() == 2:
+                    # If logits are (batch_size * seq_len, vocab_size), reshape them
+                    batch_size = x.size(0)
+                    seq_len = x.size(1)
+                    logits_reshaped = logits.view(batch_size, seq_len, -1)
+                    mlm_acc = self._calculate_mlm_accuracy(logits_reshaped, y)
+                else:
+                    mlm_acc = self._calculate_mlm_accuracy(logits, y)
 
         loss /= accumulation_steps
 
@@ -803,26 +806,47 @@ class Trainer():
                 num_tokens = 0
 
                 ddp_nosync_ctx = self.model.no_sync() if self.ddp else nullcontext()
+                log_train_mlm_acc = (
+                    self.config.train_mlm_acc_interval > 0
+                    and (step % self.config.train_mlm_acc_interval == 0)
+                )
+
                 with ddp_nosync_ctx:
                     for _ in range(self.config.accumulation_steps - 1):
-                        loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
+                        loss, ce_loss, mlm_acc, num_tokens = self.step(
+                            data_loader,
+                            self.config.accumulation_steps,
+                            num_tokens,
+                            split="train",
+                            compute_mlm_acc=log_train_mlm_acc,
+                        )
                         accumulated_loss += float(loss.detach())
                         if isinstance(ce_loss, torch.Tensor):
                             ce_loss_accum += ce_loss.detach()
                             ce_loss_steps += 1
-                        mlm_acc_accum += mlm_acc
-                        mlm_acc_steps += 1
+                        if mlm_acc is not None:
+                            mlm_acc_accum += mlm_acc
+                            mlm_acc_steps += 1
 
-                loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
+                loss, ce_loss, mlm_acc, num_tokens = self.step(
+                    data_loader,
+                    self.config.accumulation_steps,
+                    num_tokens,
+                    split="train",
+                    compute_mlm_acc=log_train_mlm_acc,
+                )
                 accumulated_loss += float(loss.detach())
                 if isinstance(ce_loss, torch.Tensor):
                     ce_loss_accum += ce_loss.detach()
                     ce_loss_steps += 1
-                mlm_acc_accum += mlm_acc
-                mlm_acc_steps += 1
+                if mlm_acc is not None:
+                    mlm_acc_accum += mlm_acc
+                    mlm_acc_steps += 1
 
                 # Calculate average MLM accuracy
-                avg_mlm_acc = mlm_acc_accum / mlm_acc_steps if mlm_acc_steps > 0 else 0.0
+                avg_mlm_acc = (
+                    mlm_acc_accum / mlm_acc_steps if mlm_acc_steps > 0 else None
+                )
 
                 # Calculate expert biases using Auxiliary Loss-Free Balance method for MoE (https://arxiv.org/pdf/2408.15664)
                 if self.use_moe and self.use_lossfreebalance: 
@@ -845,18 +869,22 @@ class Trainer():
 
                 # Logging 
                 if self.master_process:
-                    print(f"Epoch: {epoch} | Step: {step} | loss: {accumulated_loss:.4f} | acc: {avg_mlm_acc:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
+                    if avg_mlm_acc is None:
+                        print(f"Epoch: {epoch} | Step: {step} | loss: {accumulated_loss:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
+                    else:
+                        print(f"Epoch: {epoch} | Step: {step} | loss: {accumulated_loss:.4f} | acc: {avg_mlm_acc:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
                 if self.master_process and self.use_wandb and (step % self.config.wandb_log_interval == 0):
                     global_step = epoch * num_steps_per_epoch + step
                     log_data = {
                         "train/loss": float(accumulated_loss),
-                        "train/mlm_accuracy": float(avg_mlm_acc),
                         "train/grad_norm": float(norm),
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/tokens_per_sec": float(tokens_per_sec),
                         "train/epoch": epoch,
                         "train/step": step,
                     }
+                    if avg_mlm_acc is not None:
+                        log_data["train/mlm_accuracy"] = float(avg_mlm_acc)
                     if ce_loss_steps > 0:
                         log_data["train/ce_loss"] = float(ce_loss_accum / ce_loss_steps)
                     if self.use_moe:
