@@ -50,12 +50,13 @@ class TrainerConfig:
 
     tokenized_dataset_path: str = ""                    # path to directory with tokeized dataset
     hf_dataset_name: str = ""                           # huggingface dataset name (e.g. "HuggingFaceTB/cosmopedia")
-    hf_dataset_config: str = "stanford"                         # optional hf dataset config name
+    hf_dataset_config: str = ""                         # optional hf dataset config name
     hf_dataset_split: str = "train"
-    hf_val_dataset_split: str = ""                      # optional validation split for streaming
+    hf_val_dataset_split: str = "validation"                      # optional validation split; if set, load val from HF hub (non-streaming too)
     hf_text_field: str = ""                             # text field name in hf dataset
     hf_add_eos: bool = True
     hf_cache_dir: str = ""                              # optional cache dir
+    hf_max_samples: int = 0                             # max samples to load from HF (0 = no limit)
     hf_num_proc: int = 1                                # map workers for tokenization
     hf_tokenized_path: str = ""                         # optional path to save/load tokenized dataset
     hf_streaming: bool = False                          # enable HF streaming mode
@@ -83,28 +84,43 @@ class DataLoader():
         self.rank = rank
         self.world_size = world_size
         self.streaming = bool(config.hf_dataset_name and config.hf_streaming)
+        self.use_hf_val_split = bool(
+            config.hf_dataset_name and config.hf_val_dataset_split and not self.streaming
+        )
 
         if self.streaming:
             self._init_streaming(self.seed)
         else:
             self.load_dataset(self.seed)
-            self.len_dataset = len(self.dataset)
-
             if rank == 0:
-                print(f"Total tokens loaded: {self.len_dataset * config.max_seq_len:,}")
+                if self.use_hf_val_split:
+                    print(
+                        f"Train tokens loaded: {len(self.train_dataset) * config.max_seq_len:,}"
+                    )
+                    print(
+                        f"Val tokens loaded: {len(self.val_dataset) * config.max_seq_len:,}"
+                    )
+                else:
+                    print(f"Total tokens loaded: {len(self.dataset) * config.max_seq_len:,}")
 
-            self.train_len_dataset = math.ceil((1 - config.val_ratio) * self.len_dataset)
-            self.val_len_dataset = self.len_dataset - self.train_len_dataset
+            if self.use_hf_val_split:
+                self.train_len_dataset = len(self.train_dataset)
+                self.val_len_dataset = len(self.val_dataset)
+                self.len_dataset = self.train_len_dataset
+            else:
+                self.len_dataset = len(self.dataset)
+                self.train_len_dataset = math.ceil((1 - config.val_ratio) * self.len_dataset)
+                self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
-            shard_size = self.len_dataset // world_size 
+            shard_size = self.train_len_dataset // world_size 
             self.train_start_idx = rank * shard_size
             self.train_end_idx = self.train_start_idx + shard_size
             self.train_current_idx = self.train_start_idx
 
-            self.val_start_idx = self.train_len_dataset
+            self.val_start_idx = 0 if self.use_hf_val_split else self.train_len_dataset
             self.val_current_idx = self.val_start_idx
 
-    def get_batch(self, current_idx: int, start_idx: int, end_idx: int):
+    def get_batch(self, dataset, current_idx: int, start_idx: int, end_idx: int, advance_epoch: bool = True):
         """
         Returns a batch of sequences for MLM training.
         For MLM, we just need the raw sequences - masking happens in the trainer.
@@ -116,13 +132,14 @@ class DataLoader():
         new_idx = current_idx + self.config.batch_size
         
         # For MLM, just get the full sequences - no need to offset by 1
-        x_list = [self.dataset[idx]['input_ids'] 
-                  for idx in range(current_idx, min(new_idx, self.len_dataset))]
+        x_list = [dataset[idx]['input_ids'] 
+                  for idx in range(current_idx, min(new_idx, end_idx))]
         x = torch.stack(x_list)
     
         if new_idx >= end_idx:
             new_idx = start_idx
-            self.new_epoch()
+            if advance_epoch:
+                self.new_epoch()
 
         return x, new_idx
 
@@ -142,15 +159,19 @@ class DataLoader():
 
         if split == "train":
             x, self.train_current_idx = self.get_batch(
+                self.train_dataset if self.use_hf_val_split else self.dataset,
                 self.train_current_idx, 
                 self.train_start_idx, 
-                self.train_end_idx
+                self.train_end_idx,
+                advance_epoch=True
             )
         else:  # validation
             x, self.val_current_idx = self.get_batch(
+                self.val_dataset if self.use_hf_val_split else self.dataset,
                 self.val_current_idx, 
                 self.val_start_idx, 
-                self.len_dataset
+                self.val_len_dataset if self.use_hf_val_split else self.len_dataset,
+                advance_epoch=not self.use_hf_val_split
             )
         # Return None for y since labels are created by _mask_inputs() in the trainer
         return x, None
@@ -164,16 +185,21 @@ class DataLoader():
             return
 
         self.load_dataset(self.seed)
-        self.len_dataset = len(self.dataset)
+        if self.use_hf_val_split:
+            self.train_len_dataset = len(self.train_dataset)
+            self.val_len_dataset = len(self.val_dataset)
+            self.len_dataset = self.train_len_dataset
+        else:
+            self.len_dataset = len(self.dataset)
+            self.train_len_dataset = math.ceil((1 - self.config.val_ratio) * self.len_dataset)
+            self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
-        self.val_len_dataset = self.len_dataset - self.train_len_dataset
-
-        shard_size = self.len_dataset // world_size 
+        shard_size = self.train_len_dataset // world_size 
         self.train_start_idx = rank * shard_size
         self.train_end_idx = self.train_start_idx + shard_size
         self.train_current_idx = self.train_start_idx
 
-        self.val_start_idx = self.train_len_dataset
+        self.val_start_idx = 0 if self.use_hf_val_split else self.train_len_dataset
         self.val_current_idx = self.val_start_idx
 
     def new_epoch(self):
@@ -181,6 +207,17 @@ class DataLoader():
         self.current_epoch += 1
         if self.streaming:
             self._reset_stream_iters(self.seed + self.current_epoch)
+            return
+        if self.use_hf_val_split:
+            if hasattr(self.train_dataset, "shuffle"):
+                self.train_dataset = self.train_dataset.shuffle(seed=self.seed + self.current_epoch)
+            else:
+                self.train_dataset = self.load_hf_dataset(
+                    self.seed + self.current_epoch,
+                    split_override=self.config.hf_dataset_split,
+                    apply_max_samples=True,
+                    allow_tokenized_path=True,
+                )
             return
         if self.config.hf_dataset_name and hasattr(self.dataset, "shuffle"):
             self.dataset = self.dataset.shuffle(seed=self.seed + self.current_epoch)
@@ -192,7 +229,24 @@ class DataLoader():
         if self.config.hf_dataset_name:
             if self.config.hf_streaming:
                 raise RuntimeError("Streaming should be initialized via _init_streaming().")
-            self.dataset = self.load_hf_dataset(seed)
+            if self.use_hf_val_split:
+                self.train_dataset = self.load_hf_dataset(
+                    seed,
+                    split_override=self.config.hf_dataset_split,
+                    apply_max_samples=True,
+                    allow_tokenized_path=True,
+                )
+                self.val_dataset = self.load_hf_dataset(
+                    seed,
+                    split_override=self.config.hf_val_dataset_split,
+                    apply_max_samples=False,
+                    allow_tokenized_path=False,
+                )
+                self.dataset = self.train_dataset
+            else:
+                self.dataset = self.load_hf_dataset(seed)
+                self.train_dataset = self.dataset
+                self.val_dataset = self.dataset
             return
 
         if DatatroveFolderDataset is None:
@@ -212,7 +266,13 @@ class DataLoader():
             seed=seed + self.rank,
         )
 
-    def load_hf_dataset(self, seed: int):
+    def load_hf_dataset(
+        self,
+        seed: int,
+        split_override: str = "",
+        apply_max_samples: bool = True,
+        allow_tokenized_path: bool = True,
+    ):
         """Load and tokenize HuggingFace dataset."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required when using hf_dataset_name.")
@@ -224,20 +284,30 @@ class DataLoader():
                 "datasets is required for hf_dataset_name. pip install datasets"
             ) from exc
 
+        max_samples = self.config.hf_max_samples if apply_max_samples else 0
+        split = split_override or self.config.hf_dataset_split
+        use_split_cap = max_samples > 0 and "[" not in split
+        if use_split_cap:
+            split = f"{split}[:{max_samples}]"
+
         dataset_kwargs = {
             "path": self.config.hf_dataset_name,
-            "split": self.config.hf_dataset_split,
+            "split": split,
         }
         if self.config.hf_dataset_config:
             dataset_kwargs["name"] = self.config.hf_dataset_config
         if self.config.hf_cache_dir:
             dataset_kwargs["cache_dir"] = self.config.hf_cache_dir
 
-        tokenized_path = self.config.hf_tokenized_path
+        tokenized_path = self.config.hf_tokenized_path if allow_tokenized_path else ""
         if tokenized_path and os.path.isdir(tokenized_path):
             dataset = load_from_disk(tokenized_path)
         else:
             dataset = load_dataset(**dataset_kwargs)
+
+        if max_samples > 0 and (tokenized_path and os.path.isdir(tokenized_path) or not use_split_cap):
+            # Cap early to avoid processing the full dataset when not streaming.
+            dataset = self._apply_hf_limit(dataset, max_samples)
 
         if "input_ids" not in dataset.column_names:
             text_field = self._resolve_text_field(dataset)
@@ -349,6 +419,7 @@ class DataLoader():
         train_dataset = load_dataset(**self._dataset_kwargs)
         self.text_field = self._resolve_text_field(train_dataset)
 
+        train_dataset = self._apply_hf_limit(train_dataset, self.config.hf_max_samples)
         train_dataset = self._shard_streaming_dataset(train_dataset)
         if self.config.hf_streaming_shuffle:
             train_dataset = train_dataset.shuffle(
@@ -360,6 +431,7 @@ class DataLoader():
         val_kwargs = dict(self._dataset_kwargs)
         val_kwargs["split"] = val_split
         val_dataset = load_dataset(**val_kwargs)
+        val_dataset = self._apply_hf_limit(val_dataset, self.config.hf_max_samples)
         val_dataset = self._shard_streaming_dataset(val_dataset)
 
         if self.rank == 0 and not self.config.hf_val_dataset_split:
@@ -391,6 +463,7 @@ class DataLoader():
         train_kwargs = dict(self._dataset_kwargs)
         train_kwargs["split"] = self.config.hf_dataset_split
         train_dataset = load_dataset(**train_kwargs)
+        train_dataset = self._apply_hf_limit(train_dataset, self.config.hf_max_samples)
         train_dataset = self._shard_streaming_dataset(train_dataset)
         if self.config.hf_streaming_shuffle:
             train_dataset = train_dataset.shuffle(
@@ -402,6 +475,7 @@ class DataLoader():
         val_kwargs = dict(self._dataset_kwargs)
         val_kwargs["split"] = val_split
         val_dataset = load_dataset(**val_kwargs)
+        val_dataset = self._apply_hf_limit(val_dataset, self.config.hf_max_samples)
         val_dataset = self._shard_streaming_dataset(val_dataset)
 
         self.train_dataset = train_dataset
@@ -421,6 +495,7 @@ class DataLoader():
         val_kwargs = dict(self._dataset_kwargs)
         val_kwargs["split"] = val_split
         val_dataset = load_dataset(**val_kwargs)
+        val_dataset = self._apply_hf_limit(val_dataset, self.config.hf_max_samples)
         val_dataset = self._shard_streaming_dataset(val_dataset)
         self.val_dataset = val_dataset
         self.val_iter = self._make_stream_iter(self.val_dataset)
@@ -454,6 +529,19 @@ class DataLoader():
 
     def _make_stream_iter(self, dataset):
         return iter(self._stream_tokenized_sequences(dataset, self.text_field))
+
+    def _apply_hf_limit(self, dataset, max_samples: int):
+        if max_samples <= 0:
+            return dataset
+        if hasattr(dataset, "take"):
+            return dataset.take(max_samples)
+        if hasattr(dataset, "select"):
+            try:
+                max_samples = min(max_samples, len(dataset))
+            except Exception:
+                pass
+            return dataset.select(range(max_samples))
+        return dataset
 
     def _stream_tokenized_sequences(self, dataset, text_field: str):
         seq_len = self.config.max_seq_len
