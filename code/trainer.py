@@ -359,17 +359,21 @@ class Trainer():
             if self.device != "cpu":
                 self.model.to(self.device)
 
+        self.base_model = self.model.module if isinstance(self.model, DDP) else self.model
+        self.raw_m = self.base_model
+
         if self.master_process:
+            base_model = self.base_model
             print("Device:", self.device)
             print(f"Model's trainable params: {sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) / 1e6:.2f}M")
             print(f"Tokens per step: {self.config.batch_size * self.config.max_seq_len * self.ddp_world_size * self.config.accumulation_steps}")
             print(f"use {'torch.compile()'}: {use_compile}")
             print(f"Use MoE: {'Yes ' if self.use_moe else 'No'}")
             if self.use_moe:
-                print(f"Number of experts: {self.model.blocks[0].ffn.num_experts}")
-                print(f"Number of used experts during inference: {self.model.blocks[0].ffn.moe_routed_experts}")
+                print(f"Number of experts: {base_model.blocks[0].ffn.num_experts}")
+                print(f"Number of used experts during inference: {base_model.blocks[0].ffn.moe_routed_experts}")
                 print(f"Method of aux_loss: {'loss-free-balance' if config.use_lossfreebalance else 'default'}")
-                print(f"Number of parameters will be used during inference: {((sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) - sum(p.numel() for p in self.model.blocks[0].ffn.parameters()) * len(self.model.blocks) * (1-(self.model.blocks[0].ffn.moe_routed_experts + self.model.blocks[0].ffn.moe_shared_experts) / (self.model.blocks[0].ffn.num_experts + self.model.blocks[0].ffn.moe_shared_experts)))) / 1e6:.2f}M")
+                print(f"Number of parameters will be used during inference: {((sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) - sum(p.numel() for p in base_model.blocks[0].ffn.parameters()) * len(base_model.blocks) * (1-(base_model.blocks[0].ffn.moe_routed_experts + base_model.blocks[0].ffn.moe_shared_experts) / (base_model.blocks[0].ffn.num_experts + base_model.blocks[0].ffn.moe_shared_experts)))) / 1e6:.2f}M")
 
         self.use_wandb = bool(config.use_wandb)
         if self.use_wandb and wandb is None:
@@ -622,12 +626,13 @@ class Trainer():
 
                 # Calculate expert biases using Auxiliary Loss-Free Balance method for MoE (https://arxiv.org/pdf/2408.15664)
                 if self.use_moe and self.use_lossfreebalance: 
-                    for block in range(len(self.model.blocks)):
-                        expert_counts = torch.bincount(ce_loss[1].flatten(), minlength=self.model.blocks[block].ffn.moe_routed_experts)  
+                    base_model = self.base_model
+                    for block in range(len(base_model.blocks)):
+                        expert_counts = torch.bincount(ce_loss[1].flatten(), minlength=base_model.blocks[block].ffn.moe_routed_experts)  
                         avg_count = expert_counts.float().mean()
                         for i, count in enumerate(expert_counts):
                             error = avg_count - count.float()
-                            self.model.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
+                            base_model.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
 
                 norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
@@ -658,7 +663,7 @@ class Trainer():
                     if ce_loss_steps > 0:
                         log_data["train/ce_loss"] = float(ce_loss_accum / ce_loss_steps)
                     if should_log_expert_stats:
-                        base_model = self.raw_m
+                        base_model = self.base_model
                         expert_counts = None
                         for layer_idx, block in enumerate(base_model.blocks):
                             ffn = block.ffn
