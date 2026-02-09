@@ -349,7 +349,11 @@ class Trainer():
 
             self.model.to(self.device)
             
-            self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
+            self.model = DDP(
+                self.model,
+                device_ids=[self.ddp_local_rank],
+                find_unused_parameters=self.use_moe,
+            )
         else:
             self.ddp = False
             self.ddp_rank = 0
