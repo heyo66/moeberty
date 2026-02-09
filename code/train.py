@@ -44,7 +44,7 @@ args = parse_args()
 
 train_config = TrainerConfig(
     vocab_size = 50368,
-    num_epochs = 1,
+    num_epochs = 10,
 
     use_ddp = args.ddp,
     use_moe = True,
@@ -55,8 +55,8 @@ train_config = TrainerConfig(
 
     seed = 42,
     max_seq_len = 128,
-    batch_size = 1024,
-    accumulation_steps = 2,
+    batch_size = 512,
+    accumulation_steps = 1,
     
     weight_decay = 0.1,
     warmup_ratio = 0.1,
@@ -78,7 +78,7 @@ train_config = TrainerConfig(
     hf_dataset_config = "en",
     hf_dataset_split = "train",
     hf_text_field = "text",
-    hf_add_eos = True,
+    hf_add_eos = False,
     hf_cache_dir = "./.cache/hf",
     hf_tokenized_path = "./.cache/tokenized",
     hf_num_proc = 64,
@@ -86,6 +86,10 @@ train_config = TrainerConfig(
     use_wandb = True,
     wandb_project = "forschungsprojekt",
     wandb_run_name = "moebert",
+    log_mlm_accuracy = True,
+    mlm_accuracy_interval = 100,
+    log_expert_stats = True,
+    expert_stats_interval = 100,
 )
 
 config = ModelConfig(
@@ -114,7 +118,7 @@ config = ModelConfig(
         use_moe = True,
 
         moe_num_experts = 16,
-        moe_routed_experts = 2,
+        moe_routed_experts = 1,
         moe_eps = 1e-6,
         moe_aux_loss_coef = 0.01,
         moe_shared_experts = 1,
