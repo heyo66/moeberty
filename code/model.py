@@ -413,6 +413,7 @@ class FFNwMoE(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_id: Optional[int] = None):
         super().__init__()
+        self.is_first_block = (layer_id == 0)
 
         self.attention = FlexBertUnpadAttention(config, layer_id=layer_id)
         if config.use_moe:
@@ -426,8 +427,12 @@ class Block(nn.Module):
 
     def forward(self, x, start_pos):
         _ = start_pos
+        if self.is_first_block:
+            attn_in = x
+        else:
+            attn_in = self.norm_attention(x)
         x = x + self.attention(
-            self.norm_attention(x)
+            attn_in
             )
         
         ffn_out, aux_loss = self.ffn(
@@ -461,6 +466,7 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
 
         # config.ffn_hidden_dims = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         self.tokens_embedding = nn.Embedding(self.vocab_size, self.num_dims)
+        self.norm_embeddings = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
 
         self.blocks = nn.ModuleList()
         for layer_id in range(self.num_layers):
@@ -481,6 +487,7 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
 
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0):
         x = self.tokens_embedding(x)
+        x = self.norm_embeddings(x)
         
         # if self.freqs_complex == None:
         #     self.freqs_complex = precompute_theta_pos_frequencies(self.num_dims // self.num_heads, self.context_len * 2, device=x.device)
