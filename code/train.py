@@ -17,7 +17,7 @@ tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
 tokenizer.pad_token = tokenizer.eos_token
 
 checkpoint_path = './model_testing'
-continue_train = False
+continue_train = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -126,9 +126,22 @@ config = ModelConfig(
 )
 
 
+def resolve_checkpoint_path(path: str) -> str:
+    if os.path.isdir(path):
+        candidates = []
+        for name in os.listdir(path):
+            if name.endswith(".pt"):
+                candidates.append(os.path.join(path, name))
+        if not candidates:
+            raise FileNotFoundError(f"No .pt checkpoints found in directory: {path}")
+        return max(candidates, key=os.path.getmtime)
+    return path
+
+
 model = Transformer(config)
 if continue_train:
-    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path)
+    checkpoint = torch.load(resolved_checkpoint_path, map_location=torch.device('cpu'))
 
     state_dict = checkpoint['model']
     new_state_dict = {}
@@ -139,6 +152,7 @@ if continue_train:
             new_state_dict[k] = v
 
     model.load_state_dict(new_state_dict, strict=False)
+    print(f"Loaded checkpoint: {resolved_checkpoint_path}")
 
 rank = 0
 world_size = 1
