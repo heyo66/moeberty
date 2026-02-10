@@ -138,21 +138,42 @@ def resolve_checkpoint_path(path: str) -> str:
     return path
 
 
+def _strip_known_prefixes(key: str) -> str:
+    prefixes = ("module.", "_orig_mod.")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
+    return key
+
+
+def _normalize_state_dict(state_dict: dict) -> dict:
+    return {_strip_known_prefixes(k): v for k, v in state_dict.items()}
+
+
 model = Transformer(config)
 if continue_train:
     resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path)
     checkpoint = torch.load(resolved_checkpoint_path, map_location=torch.device('cpu'))
 
     state_dict = checkpoint['model']
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("_orig_mod."):
-            new_state_dict[k[len("_orig_mod."):]] = v 
-        else:
-            new_state_dict[k] = v
+    new_state_dict = _normalize_state_dict(state_dict)
 
-    model.load_state_dict(new_state_dict, strict=False)
+    incompatible = model.load_state_dict(new_state_dict, strict=False)
     print(f"Loaded checkpoint: {resolved_checkpoint_path}")
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"Checkpoint load report: "
+            f"{len(incompatible.missing_keys)} missing, "
+            f"{len(incompatible.unexpected_keys)} unexpected"
+        )
+        if incompatible.missing_keys:
+            print("Missing keys (sample):", incompatible.missing_keys[:10])
+        if incompatible.unexpected_keys:
+            print("Unexpected keys (sample):", incompatible.unexpected_keys[:10])
 
 rank = 0
 world_size = 1
