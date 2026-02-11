@@ -137,6 +137,20 @@ class Layernorm(torch.nn.Module):
 
     def forward(self, x):
         return self.g * self._norm(x.float()).type_as(x)
+
+
+class BF16LayerNorm(nn.LayerNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Always force to BF16 on CUDA
+        if x.device.type == "cuda":
+            x = x.to(dtype=torch.bfloat16)
+            weight = self.weight.to(dtype=torch.bfloat16) if self.weight is not None else None
+            bias = self.bias.to(dtype=torch.bfloat16) if self.bias is not None else None
+            with torch.autocast(device_type="cuda", enabled=False):
+                return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+
+        # Standard path for CPU or other devices
+        return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
     
 
 class GroupedQueryAttention(nn.Module):
@@ -422,8 +436,8 @@ class Block(nn.Module):
             self.ffn = FeedForward(config)
 
 
-        self.norm_attention = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
-        self.norm_ffn = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
+        self.norm_attention = BF16LayerNorm(config.num_dims, eps=config.layernorm_eps)
+        self.norm_ffn = BF16LayerNorm(config.num_dims, eps=config.layernorm_eps)
 
     def forward(self, x, start_pos):
         _ = start_pos
@@ -466,13 +480,13 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
 
         # config.ffn_hidden_dims = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         self.tokens_embedding = nn.Embedding(self.vocab_size, self.num_dims)
-        self.norm_embeddings = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
+        self.norm_embeddings = BF16LayerNorm(config.num_dims, eps=config.layernorm_eps)
 
         self.blocks = nn.ModuleList()
         for layer_id in range(self.num_layers):
             self.blocks.append(Block(config, layer_id=layer_id))
 
-        self.norm = nn.LayerNorm(config.num_dims, eps=config.layernorm_eps)
+        self.norm = BF16LayerNorm(config.num_dims, eps=config.layernorm_eps)
         self.ll_head = nn.Linear(self.num_dims, self.vocab_size, bias=False)
         
 
