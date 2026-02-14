@@ -353,6 +353,7 @@ class Trainer():
                 self.model,
                 device_ids=[self.ddp_local_rank],
                 find_unused_parameters=self.use_moe,
+                static_graph=True,
             )
         else:
             self.ddp = False
@@ -632,7 +633,10 @@ class Trainer():
                 if self.use_moe and self.use_lossfreebalance: 
                     base_model = self.base_model
                     for block in range(len(base_model.blocks)):
-                        expert_counts = torch.bincount(ce_loss[1].flatten(), minlength=base_model.blocks[block].ffn.moe_routed_experts)  
+                        topk_indices = getattr(base_model.blocks[block].ffn, "last_topk_indices", None)
+                        if topk_indices is None:
+                            continue
+                        expert_counts = torch.bincount(topk_indices.flatten(), minlength=base_model.blocks[block].ffn.num_experts)  
                         avg_count = expert_counts.float().mean()
                         for i, count in enumerate(expert_counts):
                             error = avg_count - count.float()
