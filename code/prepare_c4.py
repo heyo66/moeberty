@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 Prepare and tokenize the C4 dataset for MLM training.
 
@@ -12,7 +12,7 @@ Example:
     --tokenizer answerdotai/ModernBERT-base \
     --dataset allenai/c4 \
     --config en \
-    --split train[:10%] \
+    --split train \
 """
 
 import argparse

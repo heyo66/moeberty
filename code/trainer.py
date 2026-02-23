@@ -50,7 +50,7 @@ class TrainerConfig:
 
     tokenized_dataset_path: str = ""                    # path to directory with tokeized dataset
     hf_dataset_name: str = ""                           # huggingface dataset name (e.g. "HuggingFaceTB/cosmopedia")
-    hf_dataset_config: str = "stanford"                         # optional hf dataset config name
+    hf_dataset_config: str = ""                         # optional hf dataset config name
     hf_dataset_split: str = "train"
     hf_text_field: str = ""                             # text field name in hf dataset
     hf_add_eos: bool = True
@@ -473,7 +473,6 @@ class Trainer():
             masked_inputs[random_token_mask] = random_tokens[random_token_mask]
     
         # Remaining 10% of masked tokens -> keep unchanged
-        # (no action needed, already in masked_inputs)
     
         return masked_inputs, labels
     
@@ -543,7 +542,6 @@ class Trainer():
         num_steps_per_epoch = math.ceil(data_loader.num_train_steps() / self.config.accumulation_steps)
 
         # Configuration of optimizer and schedulers
-        # Using AdamW with cosine decay and warmup - similar to Llama's training setup
         optimizer = torch.optim.AdamW(
             self.model.parameters(),  
             lr=self.config.learning_rate,

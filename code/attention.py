@@ -1,3 +1,16 @@
+# Copyright 2024 onwards Answer.AI, LightOn, and contributors
+# License: Apache-2.0
+
+# Copyright 2022 MosaicML Examples authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Copyright 2023 MosaicML Examples authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018-2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, Tri Dao.
+
 from __future__ import annotations
 
 import torch

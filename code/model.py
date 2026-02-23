@@ -32,9 +32,8 @@ except ImportError:
 
 
 
-# ==============================================================================
 # HuggingFace-compatible Configuration
-# ==============================================================================
+
 
 class CustomTransformerConfig(PretrainedConfig):
     """
@@ -172,7 +171,7 @@ class ModelConfig:
     moe_num_experts: int
     moe_routed_experts: int
     moe_eps: float = 1e-6
-    moe_aux_loss_coef: float = 0.01
+    moe_aux_loss_coef: float = 0.00
     moe_shared_experts: int = 0
     use_lossfreebalance: bool = False
 
@@ -211,9 +210,7 @@ class ModelConfig:
             self.use_fa2 = self.use_flash
 
 
-# ==============================================================================
 # Model Layers
-# ==============================================================================
 
 class FlexBertUnpadAttention(nn.Module):
     """Thin wrapper that preserves the state_dict key path: block.attention.attn.*
@@ -483,9 +480,8 @@ class Block(nn.Module):
         return x, aux_loss
 
 
-# ==============================================================================
+
 # Core Transformer (nn.Module backbone used inside HF wrappers)
-# ==============================================================================
 
 class Transformer(nn.Module):
     """ModernBERT-style Transformer: unpad once before embeddings, repad once at
@@ -629,9 +625,8 @@ class Transformer(nn.Module):
         return x
 
 
-# ==============================================================================
+
 # HuggingFace PreTrainedModel Wrappers
-# ==============================================================================
 
 class CustomTransformerPreTrainedModel(PreTrainedModel):
     """Base class for CustomTransformer models."""
@@ -872,9 +867,8 @@ class CustomTransformerForSequenceClassification(CustomTransformerPreTrainedMode
         )
 
 
-# ==============================================================================
+
 # Auto-registration
-# ==============================================================================
 
 try:
     from transformers import AutoConfig, AutoModel, AutoModelForMaskedLM, AutoModelForSequenceClassification
