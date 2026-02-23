@@ -5,6 +5,9 @@ from trainer import Trainer, TrainerConfig, DataLoader
 
 from transformers import AutoTokenizer
 import torch
+import torch.distributed as dist
+import argparse
+import os
 
 torch.set_float32_matmul_precision('high')
 torch.cuda.empty_cache()
@@ -14,24 +17,46 @@ tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
 tokenizer.pad_token = tokenizer.eos_token
 
 checkpoint_path = './model_testing'
-continue_train = False
+continue_train = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def setup_distributed():
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available in this build.")
+    if dist.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ddp", action="store_true", help="Enable DDP (launch with torchrun).")
+    return parser.parse_args()
+
+args = parse_args()
 
 train_config = TrainerConfig(
     vocab_size = 50368,
-    num_epochs = 1,
+    num_epochs = 10,
 
-    use_ddp = True,
+    use_ddp = args.ddp,
     use_moe = True,
-    use_lossfreebalance = False,
+    use_lossfreebalance = True,
     clean_cuda_cache = True,
     use_compile = True,
     use_dtype = "bfloat16",
 
-    seed = 1338,
-    max_seq_len = 1024,
-    batch_size = 16, # 16,
-    accumulation_steps = 16,
+    seed = 42,
+    max_seq_len = 128,
+    batch_size = 512,
+    accumulation_steps = 1,
     
     weight_decay = 0.1,
     warmup_ratio = 0.1,
@@ -49,18 +74,22 @@ train_config = TrainerConfig(
     path_to_checkpoints = "./model_testing",
 
     tokenized_dataset_path = "",
-    hf_dataset_name = "HuggingFaceTB/cosmopedia",
-    hf_dataset_config = "stanford",
+    hf_dataset_name = "allenai/c4",
+    hf_dataset_config = "en",
     hf_dataset_split = "train",
     hf_text_field = "text",
-    hf_add_eos = True,
+    hf_add_eos = False,
     hf_cache_dir = "./.cache/hf",
     hf_tokenized_path = "./.cache/tokenized",
     hf_num_proc = 64,
-    eval_log_file = "log/eval_cosmopedia.txt",
+    eval_log_file = "log/eval_c4.txt",
     use_wandb = True,
     wandb_project = "forschungsprojekt",
-    wandb_run_name = "smollm-moe",
+    wandb_run_name = "moebert",
+    log_mlm_accuracy = True,
+    mlm_accuracy_interval = 100,
+    log_expert_stats = True,
+    expert_stats_interval = 100,
 )
 
 config = ModelConfig(
@@ -69,28 +98,27 @@ config = ModelConfig(
         num_dims = 768,
         num_heads = 12,
         num_kv_heads = 12,
-        num_layers = 14,
-        ffn_hidden_dims = 512 * 2,
+        num_layers = 22,
+        ffn_hidden_dims = 1152,
 
-        rmsnorm_eps = 1e-6,
+        layernorm_eps=1e-6,
 
-        attention_probs_dropout_prob = 0.0,
+        attention_probs_dropout_prob = 0.1,
         attn_qkv_bias = False,
         attn_out_bias = False,
         attn_out_dropout_prob = 0.0,
         global_attn_every_n_layers = 3,
         sliding_window = 128,
-        rotary_emb_base = 160000,
-        local_attn_rotary_emb_base = 10000,
+        rotary_emb_base = 10000,
     
-        context_len = 1024,
+        context_len = 128,
         
         use_cache = False,
         use_flash = True,
         use_moe = True,
 
-        moe_num_experts = 4,
-        moe_routed_experts = 2,
+        moe_num_experts = 16,
+        moe_routed_experts = 1,
         moe_eps = 1e-6,
         moe_aux_loss_coef = 0.01,
         moe_shared_experts = 1,
@@ -98,22 +126,67 @@ config = ModelConfig(
 )
 
 
+def resolve_checkpoint_path(path: str) -> str:
+    if os.path.isdir(path):
+        candidates = []
+        for name in os.listdir(path):
+            if name.endswith(".pt"):
+                candidates.append(os.path.join(path, name))
+        if not candidates:
+            raise FileNotFoundError(f"No .pt checkpoints found in directory: {path}")
+        return max(candidates, key=os.path.getmtime)
+    return path
+
+
+def _strip_known_prefixes(key: str) -> str:
+    prefixes = ("module.", "_orig_mod.")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
+    return key
+
+
+def _normalize_state_dict(state_dict: dict) -> dict:
+    return {_strip_known_prefixes(k): v for k, v in state_dict.items()}
+
+
 model = Transformer(config)
 if continue_train:
-    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    resolved_checkpoint_path = resolve_checkpoint_path(checkpoint_path)
+    checkpoint = torch.load(resolved_checkpoint_path, map_location=torch.device('cpu'))
 
     state_dict = checkpoint['model']
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("_orig_mod."):
-            new_state_dict[k[len("_orig_mod."):]] = v 
-        else:
-            new_state_dict[k] = v
+    new_state_dict = _normalize_state_dict(state_dict)
 
-    model.load_state_dict(new_state_dict, strict=False)
+    incompatible = model.load_state_dict(new_state_dict, strict=False)
+    print(f"Loaded checkpoint: {resolved_checkpoint_path}")
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"Checkpoint load report: "
+            f"{len(incompatible.missing_keys)} missing, "
+            f"{len(incompatible.unexpected_keys)} unexpected"
+        )
+        if incompatible.missing_keys:
+            print("Missing keys (sample):", incompatible.missing_keys[:10])
+        if incompatible.unexpected_keys:
+            print("Unexpected keys (sample):", incompatible.unexpected_keys[:10])
 
-model.to(device)
+rank = 0
+world_size = 1
+if args.ddp:
+    setup_distributed()
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
 
-data_loader = DataLoader(train_config, tokenizer=tokenizer)
+if not args.ddp:
+    model.to(device)
+
+data_loader = DataLoader(train_config, tokenizer=tokenizer, rank=rank, world_size=world_size)
 trainer = Trainer(train_config, model, tokenizer)
 trainer.train(data_loader)
+
+cleanup_distributed()

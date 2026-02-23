@@ -61,3 +61,4 @@ data/scratch/*
 !data/scratch/.gitkeep
 code/Untitled1.ipynb
 .vscode/settings.json
+code/Train_note.ipynb

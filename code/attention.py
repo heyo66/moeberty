@@ -1,3 +1,16 @@
+# Copyright 2024 onwards Answer.AI, LightOn, and contributors
+# License: Apache-2.0
+
+# Copyright 2022 MosaicML Examples authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Copyright 2023 MosaicML Examples authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018-2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, Tri Dao.
+
 from __future__ import annotations
 
 import torch
@@ -30,13 +43,6 @@ logger.warn_once = _warn_once
 class ModuleType:
     in_module = "in_module"
     out_module = "out_module"
-
-
-def init_weights(config, module, layer_dim: int, layer_id, type_of_module) -> None:
-    if hasattr(module, "weight") and module.weight is not None:
-        nn.init.normal_(module.weight, mean=0.0, std=0.006)
-    if hasattr(module, "bias") and module.bias is not None:
-        nn.init.normal_(module.bias, mean=0.0, std=0.006)
 
 
 try:

@@ -63,6 +63,10 @@ class TrainerConfig:
     wandb_run_name: str = ""
     wandb_entity: str = ""
     wandb_log_interval: int = 1
+    log_mlm_accuracy: bool = True
+    mlm_accuracy_interval: int = 1
+    log_expert_stats: bool = False
+    expert_stats_interval: int = 100
     mlm_probability: float = 0.15
 
 
@@ -75,6 +79,7 @@ class DataLoader():
         self.seed = config.seed
         self.token_size = 2 if config.vocab_size < 65535 else 4
         self.rank = rank
+        self.world_size = world_size
 
         self.load_dataset(self.seed)
         self.len_dataset = len(self.dataset)
@@ -271,6 +276,12 @@ class DataLoader():
                 dataset.save_to_disk(tokenized_path)
 
         dataset = dataset.shuffle(seed=seed)
+        if self.world_size > 1:
+            dataset = dataset.shard(
+                num_shards=self.world_size,
+                index=self.rank,
+                contiguous=True
+            )
         dataset.set_format(type="torch", columns=["input_ids"])
         return dataset
 
@@ -322,7 +333,12 @@ class Trainer():
             self.model = torch.compile(self.model)
             
         # DDP
-        if n_gpus > 1 and config.use_ddp:   
+        if n_gpus > 1 and config.use_ddp:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "DDP requested but torch.distributed is not initialized. "
+                    "Launch with torchrun and call init_process_group() before Trainer()."
+                )
             self.ddp = True
             self.ddp_rank = int(os.environ['RANK'])
             self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -333,7 +349,12 @@ class Trainer():
 
             self.model.to(self.device)
             
-            self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
+            self.model = DDP(
+                self.model,
+                device_ids=[self.ddp_local_rank],
+                find_unused_parameters=self.use_moe,
+                static_graph=True,
+            )
         else:
             self.ddp = False
             self.ddp_rank = 0
@@ -343,17 +364,21 @@ class Trainer():
             if self.device != "cpu":
                 self.model.to(self.device)
 
+        self.base_model = self.model.module if isinstance(self.model, DDP) else self.model
+        self.raw_m = self.base_model
+
         if self.master_process:
+            base_model = self.base_model
             print("Device:", self.device)
             print(f"Model's trainable params: {sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) / 1e6:.2f}M")
             print(f"Tokens per step: {self.config.batch_size * self.config.max_seq_len * self.ddp_world_size * self.config.accumulation_steps}")
             print(f"use {'torch.compile()'}: {use_compile}")
             print(f"Use MoE: {'Yes ' if self.use_moe else 'No'}")
             if self.use_moe:
-                print(f"Number of experts: {self.model.blocks[0].ffn.num_experts}")
-                print(f"Number of used experts during inference: {self.model.blocks[0].ffn.moe_routed_experts}")
+                print(f"Number of experts: {base_model.blocks[0].ffn.num_experts}")
+                print(f"Number of used experts during inference: {base_model.blocks[0].ffn.moe_routed_experts}")
                 print(f"Method of aux_loss: {'loss-free-balance' if config.use_lossfreebalance else 'default'}")
-                print(f"Number of parameters will be used during inference: {((sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) - sum(p.numel() for p in self.model.blocks[0].ffn.parameters()) * len(self.model.blocks) * (1-(self.model.blocks[0].ffn.moe_routed_experts + self.model.blocks[0].ffn.moe_shared_experts) / (self.model.blocks[0].ffn.num_experts + self.model.blocks[0].ffn.moe_shared_experts)))) / 1e6:.2f}M")
+                print(f"Number of parameters will be used during inference: {((sum([p.data.numel() for p in self.model.parameters() if p.requires_grad]) - sum(p.numel() for p in base_model.blocks[0].ffn.parameters()) * len(base_model.blocks) * (1-(base_model.blocks[0].ffn.moe_routed_experts + base_model.blocks[0].ffn.moe_shared_experts) / (base_model.blocks[0].ffn.num_experts + base_model.blocks[0].ffn.moe_shared_experts)))) / 1e6:.2f}M")
 
         self.use_wandb = bool(config.use_wandb)
         if self.use_wandb and wandb is None:
@@ -480,7 +505,7 @@ class Trainer():
         return accuracy.item()
     
     def step(self, data_loader, accumulation_steps: int,
-              num_tokens: int, split: str = "train"):
+              num_tokens: int, split: str = "train", compute_mlm_accuracy: bool = True):
         """
         Performs single forward/backward pass with gradient accumulation.
         Returns: (total_loss, cross_entropy_loss, mlm_accuracy, number_of_processed_tokens)
@@ -495,16 +520,18 @@ class Trainer():
 
         # Calculate MLM accuracy (before loss division and backward)
         # Detach logits to avoid keeping computation graph for accuracy calculation
-        with torch.no_grad():
-            # Ensure logits are in the right shape (batch_size, seq_len, vocab_size)
-            if logits.dim() == 2:
-                # If logits are (batch_size * seq_len, vocab_size), reshape them
-                batch_size = x.size(0)
-                seq_len = x.size(1)
-                logits_reshaped = logits.view(batch_size, seq_len, -1)
-                mlm_acc = self._calculate_mlm_accuracy(logits_reshaped, y)
-            else:
-                mlm_acc = self._calculate_mlm_accuracy(logits, y)
+        mlm_acc = None
+        if compute_mlm_accuracy:
+            with torch.no_grad():
+                # Ensure logits are in the right shape (batch_size, seq_len, vocab_size)
+                if logits.dim() == 2:
+                    # If logits are (batch_size * seq_len, vocab_size), reshape them
+                    batch_size = x.size(0)
+                    seq_len = x.size(1)
+                    logits_reshaped = logits.view(batch_size, seq_len, -1)
+                    mlm_acc = self._calculate_mlm_accuracy(logits_reshaped, y)
+                else:
+                    mlm_acc = self._calculate_mlm_accuracy(logits, y)
 
         loss /= accumulation_steps
 
@@ -556,36 +583,64 @@ class Trainer():
                 mlm_acc_steps = 0
                 num_tokens = 0
 
+                should_log_mlm_acc = (
+                    self.config.log_mlm_accuracy
+                    and (step % self.config.mlm_accuracy_interval == 0 or step == last_step)
+                )
+                should_log_expert_stats = (
+                    self.use_moe
+                    and self.config.log_expert_stats
+                    and (step % self.config.expert_stats_interval == 0 or step == last_step)
+                )
+
                 ddp_nosync_ctx = self.model.no_sync() if self.ddp else nullcontext()
                 with ddp_nosync_ctx:
                     for _ in range(self.config.accumulation_steps - 1):
-                        loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
+                        loss, ce_loss, mlm_acc, num_tokens = self.step(
+                            data_loader,
+                            self.config.accumulation_steps,
+                            num_tokens,
+                            split="train",
+                            compute_mlm_accuracy=should_log_mlm_acc,
+                        )
                         accumulated_loss += loss
                         if isinstance(ce_loss, torch.Tensor):
                             ce_loss_accum += ce_loss.detach()
                             ce_loss_steps += 1
-                        mlm_acc_accum += mlm_acc
-                        mlm_acc_steps += 1
+                        if mlm_acc is not None:
+                            mlm_acc_accum += mlm_acc
+                            mlm_acc_steps += 1
 
-                loss, ce_loss, mlm_acc, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, split="train")
+                loss, ce_loss, mlm_acc, num_tokens = self.step(
+                    data_loader,
+                    self.config.accumulation_steps,
+                    num_tokens,
+                    split="train",
+                    compute_mlm_accuracy=should_log_mlm_acc,
+                )
                 accumulated_loss += loss.detach()
                 if isinstance(ce_loss, torch.Tensor):
                     ce_loss_accum += ce_loss.detach()
                     ce_loss_steps += 1
-                mlm_acc_accum += mlm_acc
-                mlm_acc_steps += 1
+                if mlm_acc is not None:
+                    mlm_acc_accum += mlm_acc
+                    mlm_acc_steps += 1
 
                 # Calculate average MLM accuracy
-                avg_mlm_acc = mlm_acc_accum / mlm_acc_steps if mlm_acc_steps > 0 else 0.0
+                avg_mlm_acc = mlm_acc_accum / mlm_acc_steps if mlm_acc_steps > 0 else None
 
                 # Calculate expert biases using Auxiliary Loss-Free Balance method for MoE (https://arxiv.org/pdf/2408.15664)
                 if self.use_moe and self.use_lossfreebalance: 
-                    for block in range(len(self.model.blocks)):
-                        expert_counts = torch.bincount(ce_loss[1].flatten(), minlength=self.model.blocks[block].ffn.moe_routed_experts)  
+                    base_model = self.base_model
+                    for block in range(len(base_model.blocks)):
+                        topk_indices = getattr(base_model.blocks[block].ffn, "last_topk_indices", None)
+                        if topk_indices is None:
+                            continue
+                        expert_counts = torch.bincount(topk_indices.flatten(), minlength=base_model.blocks[block].ffn.num_experts)  
                         avg_count = expert_counts.float().mean()
                         for i, count in enumerate(expert_counts):
                             error = avg_count - count.float()
-                            self.model.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
+                            base_model.blocks[block].ffn.expert_biases.data[i] += self.update_rate * torch.sign(error)
 
                 norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
@@ -599,22 +654,24 @@ class Trainer():
 
                 # Logging 
                 if self.master_process:
-                    print(f"Epoch: {epoch} | Step: {step} | loss: {accumulated_loss:.4f} | acc: {avg_mlm_acc:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
+                    acc_str = f"{avg_mlm_acc:.4f}" if avg_mlm_acc is not None else "n/a"
+                    print(f"Epoch: {epoch} | Step: {step} | loss: {accumulated_loss:.4f} | acc: {acc_str} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
                 if self.master_process and self.use_wandb and (step % self.config.wandb_log_interval == 0):
                     global_step = epoch * num_steps_per_epoch + step
                     log_data = {
                         "train/loss": float(accumulated_loss),
-                        "train/mlm_accuracy": float(avg_mlm_acc),
                         "train/grad_norm": float(norm),
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/tokens_per_sec": float(tokens_per_sec),
                         "train/epoch": epoch,
                         "train/step": step,
                     }
+                    if avg_mlm_acc is not None:
+                        log_data["train/mlm_accuracy"] = float(avg_mlm_acc)
                     if ce_loss_steps > 0:
                         log_data["train/ce_loss"] = float(ce_loss_accum / ce_loss_steps)
-                    if self.use_moe:
-                        base_model = self.raw_m
+                    if should_log_expert_stats:
+                        base_model = self.base_model
                         expert_counts = None
                         for layer_idx, block in enumerate(base_model.blocks):
                             ffn = block.ffn
